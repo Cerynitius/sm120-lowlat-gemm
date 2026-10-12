@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel", "torch"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sm120-lowlat-gemm"
+version = "0.1.0"
+description = "Low-latency skinny BF16 GEMM (M <= 16) for NVIDIA Blackwell SM120 GPUs (RTX PRO 6000 / RTX 50)"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [{ name = "Cerynitius" }]
+dependencies = ["torch>=2.6"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.entry-points."vllm.general_plugins"]
+lowlat_gemm = "lowlat_gemm.vllm_plugin:register"
+
+[tool.setuptools]
+packages = ["lowlat_gemm"]
+
+[tool.setuptools.package-data]
+lowlat_gemm = ["plans/*.json"]

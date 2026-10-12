@@ -1,0 +1,18 @@
+{
+  "model": "Qwen/Qwen3.8-Flash-Next, TP=1, BF16 projections as merged by vLLM 0.30 (qwen4_exp)",
+  "shapes": [
+    {"name": "gdn.in_proj_qkvz", "n": 16384, "k": 2560, "per_token": 36},
+    {"name": "gdn.in_proj_ba", "n": 96, "k": 2560, "per_token": 36},
+    {"name": "gdn.out_proj / qsa.o_proj", "n": 2560, "k": 6144, "per_token": 48},
+    {"name": "qsa.qkv_gate", "n": 13312, "k": 2560, "per_token": 12},
+    {"name": "qsa.indexer.index_qk_proj", "n": 640, "k": 2560, "per_token": 12},
+    {"name": "moe.router", "n": 512, "k": 2560, "per_token": 48},
+    {"name": "moe.shared_expert.gate_up", "n": 1280, "k": 2560, "per_token": 48},
+    {"name": "moe.shared_expert.down", "n": 2560, "k": 640, "per_token": 48},
+    {"name": "hc.mix_down_inject", "n": 336, "k": 10240, "per_token": 96},
+    {"name": "hc.mix_up", "n": 10240, "k": 320, "per_token": 96},
+    {"name": "hc.final_mix_down", "n": 320, "k": 10240, "per_token": 1},
+    {"name": "lm_head", "n": 248320, "k": 2560, "per_token": 1},
+    {"name": "mtp.fc", "n": 2560, "k": 2560, "per_token": 2}
+  ]
+}

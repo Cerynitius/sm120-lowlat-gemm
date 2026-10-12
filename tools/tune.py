@@ -38,7 +38,7 @@ def tc_candidates(kind: str, m: int, n: int, k: int):
         for swap in ((True,) if kind in L._MIXED else (True, False)):
             bp, bq, _, _ = L.tc_info(kind, cfg)
             p, q = (n, m) if swap else (m, n)
-            if bq > 2 * q and bq > 8:  # tile far wider than the problem: skip
+            if (bq > 2 * q and bq > 8) or (bp > 4 * p and bp > 64):  # tile far larger than the problem: skip
                 continue
             for stages in sorted({2, min(3, top), min(4, top), top}):
                 for ks in KSPLITS:
@@ -54,6 +54,8 @@ def main() -> None:
     ap.add_argument("--out", required=True)
     ap.add_argument("--tokens", default="1,2,3,4,8,16,32,64,128,256")
     ap.add_argument("--replays", type=int, default=7)
+    ap.add_argument("--max-calls", type=int, default=0,
+                    help="cap the calls per timed graph (faster tuning; weights may then partly stay in L2)")
     args = ap.parse_args()
 
     dev = torch.device("cuda", torch.cuda.current_device())
@@ -68,6 +70,7 @@ def main() -> None:
             if (kind, n, k) in plans or k % L.KINDS[kind][2]:
                 continue
             cold = ColdWeights(kind, n, k, dev)
+            calls = min(max(len(cold), 64), args.max_calls) if args.max_calls else None
             plan = Plan()
             tc_us = {}
             for m in tokens:
@@ -75,8 +78,8 @@ def main() -> None:
                 out = torch.empty(m, n, device=dev, dtype=torch.float16 if kind == "f16" or kind.endswith("_f16") else torch.bfloat16)
                 best = None
                 for c in tc_candidates(kind, m, n, k):
-                    t = time_per_call(lambda w, kw: L.gemm(x, w, out=out, plan=Plan(tc={1: c}), **kw, **x_kw), cold,
-                                      replays=args.replays)
+                    t = time_per_call(lambda w, kw: L.gemm(x, w, out=out, plan=Plan(tc={m: c}), **kw, **x_kw), cold,
+                                      calls=calls, replays=args.replays)
                     if best is None or t < best[0]:
                         best = (t, c)
                 tc_us[m], plan.tc[m] = best
@@ -95,7 +98,7 @@ def main() -> None:
                         for tile in SKINNY_TILES:
                             order = SkinnyOrder(lanes_per_row=lanes, ksplit=ks, default_tile=tile)
                             pl = Plan(skinny=order, skinny_max_m=L.SKINNY_MAX_TOKENS)
-                            t = time_per_call(lambda w, kw: L.gemm(x, w, out=out, plan=pl), cold, replays=args.replays)
+                            t = time_per_call(lambda w, kw: L.gemm(x, w, out=out, plan=pl), cold, calls=calls, replays=args.replays)
                             if bt is None or t < bt[0]:
                                 bt = (t, tile)
                         tiles[m] = bt

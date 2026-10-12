@@ -6,3 +6,4 @@ __pycache__/
 *.o
 build.log
 .pytest_cache/
+results/

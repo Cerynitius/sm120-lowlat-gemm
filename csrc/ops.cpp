@@ -270,7 +270,11 @@ void tc_gemm_impl(at::Tensor& y, const at::Tensor& a, const at::Tensor& b, const
   }
   const c10::cuda::CUDAGuard guard(a.device());
   const bool ok = tc_dispatch(p, kind, static_cast<int>(cfg), c10::cuda::getCurrentCUDAStream());
-  TORCH_CHECK(ok, "lowlat_gemm: config ", cfg, " does not fit this kind (shared memory) or the launch setup failed");
+  if (!ok) {
+    const cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(false, "lowlat_gemm: config ", cfg, " cannot be launched for this kind: ",
+                err == cudaSuccess ? "stage does not fit shared memory" : cudaGetErrorString(err));
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

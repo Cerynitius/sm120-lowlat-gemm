@@ -134,7 +134,8 @@ struct Layout {
   static constexpr int kStageBytes = (kBSFOff + C::BQ * kBSF + 127) / 128 * 128;
 };
 
-constexpr int kMaxSmem = 99 * 1024;
+// dynamic budget: the 99 KB per-block opt-in limit minus room for the kernel's static shared memory (is_last)
+constexpr int kMaxSmem = 99 * 1024 - 128;
 
 // ---------------------------------------------------------------------------------------------------------------
 // Epilogue

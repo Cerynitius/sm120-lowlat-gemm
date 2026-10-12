@@ -2,8 +2,9 @@
 """vLLM general plugin: route unquantized BF16/FP16 projections of small batches to lowlat_gemm on SM120.
 
 Enabled only with LLG_VLLM=1. Hooks the Qwen4Exp (Qwen3.8-Flash-Next) low-latency GEMM entry point, which upstream
-vLLM fills only for SM90/SM103 at TP=4 shapes. Calls with more than LLG_VLLM_MAX_TOKENS tokens, a bias, or
-VLLM_BATCH_INVARIANT=1 keep the upstream implementation.
+vLLM fills only for SM90/SM103 at TP=4 shapes. Calls with more than LLG_VLLM_MAX_TOKENS tokens, a bias,
+VLLM_BATCH_INVARIANT=1, or a token count where the plan measured the vendor GEMM as faster keep the upstream
+implementation.
 
     LLG_VLLM=1               enable
     LLG_VLLM_MODELS=...      comma-separated hook targets (default "qwen4_exp")
@@ -39,11 +40,13 @@ def _make_methods():
 
     class _Apply:
         def apply(self, layer, x, bias=None):
+            m = x.numel() // max(1, x.shape[-1])
             if (
                 bias is None
                 and not envs.VLLM_BATCH_INVARIANT
-                and 1 <= x.numel() // max(1, x.shape[-1]) <= MAX_TOKENS
+                and 1 <= m <= MAX_TOKENS
                 and lowlat_gemm.supports(x, layer.weight)
+                and lowlat_gemm.prefer_lowlat(lowlat_gemm.kind_of(x, layer.weight), *layer.weight.shape, m, x.device)
             ):
                 return lowlat_gemm.gemm(x, layer.weight)
             return super().apply(layer, x, bias)

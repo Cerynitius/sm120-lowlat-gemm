@@ -112,7 +112,7 @@ def test_every_config_orientation_and_split(kind):
             if L.max_stages(kind, cfg) < 2:
                 continue
             c = TcChoice(cfg=cfg, swap=swap, stages=min(3, L.max_stages(kind, cfg)), ksplit=ksplit)
-            y = L.gemm(x, w, out_dtype=torch.float32, plan=Plan(tc={1: c}), **kw)
+            y = L.gemm(x, w, out_dtype=torch.float32, plan=Plan(tc={m: c}), **kw)
             e = rel_err(y, ref)
             assert e < 2e-5, f"{kind} m={m} {c}: rel err {e}"
 
@@ -155,7 +155,7 @@ def test_skinny_matches_reference(dt):
 
 def test_split_k_deterministic_and_counters_reset():
     x, w, kw, _, _ = operands("fp8", 4, 336, 4096)
-    plan = Plan(tc={1: TcChoice(cfg=0, swap=True, stages=4, ksplit=8)})
+    plan = Plan(tc={4: TcChoice(cfg=0, swap=True, stages=4, ksplit=8)})
     first = L.gemm(x, w, plan=plan, **kw)
     for _ in range(20):
         assert torch.equal(L.gemm(x, w, plan=plan, **kw), first)
@@ -165,7 +165,7 @@ def test_split_k_deterministic_and_counters_reset():
 
 def test_cuda_graph_replay():
     x, w, kw, _, _ = operands("nvfp4", 4, 512, 2048)
-    plan = Plan(tc={1: TcChoice(cfg=0, swap=True, stages=4, ksplit=4)})
+    plan = Plan(tc={4: TcChoice(cfg=0, swap=True, stages=4, ksplit=4)})
     eager = L.gemm(x, w, plan=plan, **kw)
     out = torch.empty_like(eager)
     s = torch.cuda.Stream()
@@ -223,3 +223,38 @@ def test_supports():
     assert not L.supports(x.float(), w)
     x12 = torch.randn(2, 12, device=DEV).to(torch.bfloat16)
     assert not L.supports(x12, torch.randn(3, 12, device=DEV).to(torch.bfloat16))
+
+
+def test_plan_lookup_range_and_vendor_preference():
+    a, b = TcChoice(cfg=0, swap=True, stages=4, ksplit=2), TcChoice(cfg=1, swap=True, stages=4, ksplit=1)
+    table = {1: a, 16: b}
+    assert L._tc_lookup(table, 1) is a and L._tc_lookup(table, 15) is a
+    assert L._tc_lookup(table, 16) is b and L._tc_lookup(table, 32) is b
+    assert L._tc_lookup(table, 33) is None and L._tc_lookup({}, 1) is None
+    n, k = 4160, 1024
+    L.set_plan("bf16", n, k, Plan(tc=dict(table), prefer_vendor=[16]))
+    assert L.prefer_lowlat("bf16", n, k, 8) and not L.prefer_lowlat("bf16", n, k, 20)
+    assert L.prefer_lowlat("bf16", n, k, 64)  # beyond the tuned range: no measurement, keep lowlat_gemm
+    restored = Plan.from_json(L.get_plan("bf16", n, k).to_json())
+    assert restored.prefer_vendor == [16]
+
+
+def test_packaged_plans_match_reference():
+    """Every tuned choice of the packaged plan for this device (deep pipelines, wide split-K) against float64."""
+    import json
+    from pathlib import Path
+
+    name = torch.cuda.get_device_name()
+    path = Path(L.__file__).with_name("plans") / f"{L._file_key(name)}.json"
+    if not path.is_file():
+        pytest.skip(f"no packaged plan for {name}")
+    for key, d in json.loads(path.read_text())["plans"].items():
+        kind, shape = key.split(":")
+        n, k = (int(v) for v in shape.split("x"))
+        plan = Plan.from_json(d)
+        for m, c in plan.tc.items():
+            x, w, kw, xd, wd = operands(kind, m, n, k, seed=m)
+            y = L.gemm(x, w, out_dtype=torch.float32, plan=Plan(tc={m: c}), **kw)
+            e = rel_err(y, xd @ wd.T)
+            assert e < 2e-5, f"{key} m={m} {c}: rel err {e}"
+            del x, w, xd, wd, y

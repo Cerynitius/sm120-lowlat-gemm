@@ -96,6 +96,8 @@ L.load_plans("plans.json")
 ```
 
 Lookup order: `set_plan()`, the file in `LLG_PLAN_FILE`, a packaged plan for the device, built-in heuristics.
+A tuned entry serves token counts from its M up to the next tuned M; above twice the largest tuned M the heuristics
+apply. `L.prefer_lowlat(kind, n, k, m)` is False where the plan recorded the vendor library as faster.
 Before capturing a CUDA graph, size the split-K workspace:
 
 ```python
@@ -105,8 +107,11 @@ L.reserve_workspace(torch.device("cuda", 0), *L.workspace_need("bf16", 11008, 40
 ### Tuning, benchmarks, tests
 
 ```bash
-python tools/tune.py  --shapes shapes/qwen3.8-flash-next-tp1.json --kinds bf16,fp8,nvfp4 --out plans.json
-python tools/bench.py --shapes shapes/qwen3.8-flash-next-tp1.json --kinds bf16,fp8,nvfp4 --plans plans.json
+python tools/tune.py  --shapes shapes/qwen3.8-flash-next-tp1.json --kinds bf16,fp8,nvfp4 --out plans.json \
+    [--tokens 1,2,4,8,16] [--max-calls 256]
+python tools/bench.py --shapes shapes/qwen3.8-flash-next-tp1.json --kinds bf16,fp8,nvfp4 --plans plans.json \
+    --json bench.json
+python tools/prefer_vendor.py --plans plans.json --bench bench.json   # record where the vendor library wins
 pytest tests
 python tests/emulate_tc.py        # CPU thread-level emulation of the tensor-core kernel's indexing
 ```
@@ -122,7 +127,8 @@ LLG_VLLM=1 LLG_PLAN_FILE=plans.json vllm serve <Qwen3.8-Flash-Next checkpoint> .
 ```
 
 On SM120 it routes the model's unquantized BF16 projections and LM head (and the MTP drafter's) to
-`lowlat_gemm` for batches up to `LLG_VLLM_MAX_TOKENS` (default 16).
+`lowlat_gemm` for batches up to `LLG_VLLM_MAX_TOKENS` (default 16), except token counts the plan leaves to the
+vendor library.
 
 | Variable | Meaning |
 |---|---|

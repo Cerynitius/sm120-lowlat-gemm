@@ -43,6 +43,7 @@ __all__ = [
     "gemm",
     "get_plan",
     "kind_of",
+    "prefer_lowlat",
     "load_plans",
     "quantize_fp8",
     "quantize_int8",
@@ -133,9 +134,12 @@ class Plan:
     skinny: SkinnyOrder | None = None
     skinny_max_m: int = 0              # skinny for M <= this (W16A16 only)
     tc: dict[int, TcChoice] = field(default_factory=dict)
+    prefer_vendor: list[int] = field(default_factory=list)  # measured M where the vendor library was faster
 
     def to_json(self) -> dict:
         d: dict = {"skinny_max_m": self.skinny_max_m, "tc": {str(m): asdict(c) for m, c in sorted(self.tc.items())}}
+        if self.prefer_vendor:
+            d["prefer_vendor"] = sorted(self.prefer_vendor)
         if self.skinny is not None:
             d["skinny"] = {
                 "lanes_per_row": self.skinny.lanes_per_row,
@@ -157,7 +161,18 @@ class Plan:
                 tiles={int(m): SkinnyTile(**t) for m, t in sk.get("tiles", {}).items()},
             )
         tc = {int(m): TcChoice(**c) for m, c in d.get("tc", {}).items()}
-        return cls(skinny=skinny, skinny_max_m=int(d.get("skinny_max_m", 0)), tc=tc)
+        return cls(skinny=skinny, skinny_max_m=int(d.get("skinny_max_m", 0)), tc=tc,
+                   prefer_vendor=[int(m) for m in d.get("prefer_vendor", [])])
+
+
+def _tc_lookup(table: dict, m: int):
+    """Tuned choice for m: the entry of the largest tuned M <= m, used up to twice the largest tuned M."""
+    if m in table:
+        return table[m]
+    if not table or m > 2 * max(table):
+        return None
+    lower = [k for k in table if k <= m]
+    return table[max(lower)] if lower else table[min(table)]
 
 
 def _nearest(table: dict, m: int, default):
@@ -181,7 +196,7 @@ def tc_info(kind: str, cfg: int) -> tuple[int, int, int, int]:
 
 
 def max_stages(kind: str, cfg: int) -> int:
-    return min(8, (99 * 1024) // tc_info(kind, cfg)[3])
+    return min(8, (99 * 1024 - 128) // tc_info(kind, cfg)[3])
 
 
 def default_skinny_order(n: int, k: int, sm_count: int) -> SkinnyOrder:
@@ -195,6 +210,10 @@ def default_skinny_order(n: int, k: int, sm_count: int) -> SkinnyOrder:
     return SkinnyOrder(lanes_per_row=lanes, ksplit=ksplit, default_tile=SkinnyTile(rows=rows, unroll=4, warps=4))
 
 
+# next smaller tile per config (BPxBQ): 256x128 -> 128x128 -> 64x64 -> 64x8; 128x64 -> 128x32 -> 128x16 -> 64x8
+_SMALLER = {7: 6, 6: 4, 5: 4, 4: 0, 3: 2, 2: 1, 1: 0, 0: None}
+
+
 def default_tc_choice(kind: str, m: int, n: int, k: int, sm_count: int) -> TcChoice:
     """Heuristic: weight-as-A ("swap") tiles for few tokens, square tiles for many; split K to fill the GPU."""
     if kind in _MIXED or m <= 64:
@@ -205,9 +224,16 @@ def default_tc_choice(kind: str, m: int, n: int, k: int, sm_count: int) -> TcCho
         cfg = 4 if m * n <= (1 << 20) else 6 if m * n <= (1 << 24) else 7
     while max_stages(kind, cfg) < 2:  # e.g. cfg 7 with fp4 / mixed operands
         cfg = 6 if cfg == 7 else 4
-    bp, bq, _, _ = tc_info(kind, cfg)
     p, q = (n, m) if swap else (m, n)
-    tiles = -(-p // bp) * -(-q // bq)
+
+    def tiles_of(c):
+        bp, bq, _, _ = tc_info(kind, c)
+        return -(-p // bp) * -(-q // bq)
+
+    # a grid far smaller than the GPU leaves one SM doing all the MMA work: step down to smaller tiles
+    while tiles_of(cfg) * 8 < sm_count and _SMALLER[cfg] is not None:
+        cfg = _SMALLER[cfg]
+    tiles = tiles_of(cfg)
     nk = -(-k // KINDS[kind][1])
     ksplit = 1
     while tiles * ksplit < sm_count and nk // (ksplit * 2) >= 2 and ksplit < 16:
@@ -371,6 +397,17 @@ def _vec(v, device) -> torch.Tensor | None:
     return v if v.dtype == torch.float32 and v.is_contiguous() else v.float().contiguous()
 
 
+def prefer_lowlat(kind: str, n: int, k: int, m: int, device: torch.device | None = None) -> bool:
+    """False when the plan measured the vendor library as faster at the nearest tuned M (<= m, within 2x)."""
+    plan = get_plan(kind, n, k, device)
+    if not plan.prefer_vendor or not plan.tc:
+        return True
+    tuned = [t for t in plan.tc if t <= m]
+    if not tuned or m > 2 * max(plan.tc):
+        return True
+    return max(tuned) not in plan.prefer_vendor
+
+
 def supports(x: torch.Tensor, w: torch.Tensor, x_block_scale=None, w_block_scale=None) -> bool:
     """True when gemm(x, w, ...) can run on these operands (dtype pair, K alignment, 16-byte rows)."""
     if not (x.is_cuda and w.is_cuda and w.dim() == 2 and x.dim() >= 1):
@@ -402,7 +439,7 @@ def workspace_need(kind: str, n: int, k: int, max_m: int, device: torch.device |
                 elems = max(elems, o.ksplit * m * n)
                 counters = max(counters, -(-n // (t.warps * (32 // o.lanes_per_row) * t.rows)))
             continue
-        c = _nearest(plan.tc, m, None) or default_tc_choice(kind, m, n, k, _sm_count(device))
+        c = _tc_lookup(plan.tc, m) or default_tc_choice(kind, m, n, k, _sm_count(device))
         if c.ksplit > 1:
             bp, bq, _, _ = tc_info(kind, c.cfg)
             p, q = (n, m) if (c.swap or kind in _MIXED) else (m, n)
@@ -467,7 +504,7 @@ def gemm(
         torch.ops.lowlat_gemm.skinny_out(y2, x2, w, ws, cnt, t.rows, t.unroll, order.lanes_per_row, t.warps, order.ksplit)
         return out if out is not None else y2.view(*lead, n)
 
-    c = _nearest(plan.tc, m, None) or default_tc_choice(kind, m, n, k, _sm_count(device))
+    c = _tc_lookup(plan.tc, m) or default_tc_choice(kind, m, n, k, _sm_count(device))
     swap = c.swap or kind in _MIXED
     # python floats fold into the host-side alpha (no tensor creation, so CUDA-graph capture stays legal)
     alpha_f = 1.0

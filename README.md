@@ -1,99 +1,134 @@
 # sm120-lowlat-gemm
 
-Low-latency skinny BF16 GEMM for NVIDIA Blackwell **SM120** GPUs (RTX PRO 6000 Blackwell, RTX 50 series):
+Low-latency GEMM for NVIDIA Blackwell **SM120** GPUs (RTX PRO 6000 Blackwell, RTX 50 series), any M, with the
+precisions used in LLM inference:
+
+| x (activation) | w (weight) | name |
+|---|---|---|
+| bf16 / f16 | same | W16A16 |
+| bf16 / f16 | float8_e4m3fn | W8A16 |
+| bf16 / f16 | NVFP4 (e2m1 + e4m3 scale per 16) | W4A16 |
+| float8_e4m3fn | float8_e4m3fn | W8A8 FP8 |
+| int8 | int8 | W8A8 INT8 |
+| NVFP4 | NVFP4 | W4A4 |
 
 ```
-y[M, N] = x[M, K] @ w[N, K]^T        bf16 in, fp32 accumulate, bf16 or fp32 out, 1 <= M <= 16
+y = alpha * (x * x_scale) @ (w * w_scale)^T + bias        fp32 accumulate (int32 for INT8)
 ```
 
-Built for the decode and speculative-verify steps of LLM serving, where every projection is a memory-bound
-matrix-vector product and the batch has a handful of tokens.
-
-- Weights stream once from DRAM in 16-byte vectors (L1 bypass, 256-byte L2 prefetch); no weight repacking,
-  `w` is the plain `nn.Linear` layout.
-- Optional split-K with a deterministic in-kernel reduction (no atomics on data, no extra launch).
-- **Batch invariant:** the summation order depends only on `(K, lanes_per_row, ksplit)`, which a plan fixes per
-  `(N, K)`. Row `i` of an `M`-row call is bit-identical to the 1-row call on `x[i]`, for every `M` and every tile.
-- CUDA-graph safe; a `torch.ops.lowlat_gemm` custom op with a Meta implementation.
-- Optional vLLM plugin for Qwen3.8-Flash-Next (`qwen4_exp`) on SM120.
+- Tensor-core kernel (`mma.sync` for every precision, including the SM120 block-scaled NVFP4 MMA) with a
+  cp.async multi-stage pipeline. Small batches put the weight on the 16-row MMA side, so 1-8 tokens fill one
+  m16n8 tile; large batches use square tiles.
+- Mixed precision (W8A16, W4A16) widens the weight exactly in registers; no dequantized copy.
+- Split-K with a deterministic in-kernel reduction; results are run-to-run identical.
+- A CUDA-core streaming kernel for W16A16 with at most 16 rows whose results are bit-identical for every M.
+- Per-(precision, N, K) plans pick engine and tiling per M; a tuner writes them.
+- Activation quantizers: FP8 (static or per-token), INT8 (per-token), NVFP4.
+- CUDA-graph safe custom ops (`torch.ops.lowlat_gemm`); optional vLLM plugin.
 
 ## Install
 
-Requires PyTorch with CUDA 12.8+ (13.x recommended) and a CUDA toolkit with `nvcc`.
+Requires PyTorch with CUDA 12.8+ (13.x recommended) and `nvcc`. Arch-specific targets (`sm_120a`) are required
+for the FP8 / FP4 instructions.
 
 ```bash
 pip install --no-build-isolation .
-# or, in a source tree:
+# or in a source tree:
 python setup.py build_ext --inplace
 ```
 
 | Variable | Meaning |
 |---|---|
-| `LLG_CUDA_ARCHS` | SM versions to build, `;`-separated (default `120`; e.g. `120;121`) |
+| `LLG_CUDA_ARCHS` | SM targets, `;`-separated (default `120a`; e.g. `120a;121a`) |
 | `LLG_PTXAS_VERBOSE=1` | print register / spill usage per kernel |
 
 ## Use
 
 ```python
-import torch, lowlat_gemm
+import torch, lowlat_gemm as L
 
-x = torch.randn(4, 2560, device="cuda", dtype=torch.bfloat16)
-w = torch.randn(16384, 2560, device="cuda", dtype=torch.bfloat16)
+x = torch.randn(4, 4096, device="cuda", dtype=torch.bfloat16)
 
-y = lowlat_gemm.gemm(x, w)                            # [4, 16384] bf16
-y32 = lowlat_gemm.gemm(x, w, out_dtype=torch.float32)
-lowlat_gemm.gemm(x, w, out=y)                         # write into an existing buffer
-lowlat_gemm.eligible(x, w)                            # False -> use torch.nn.functional.linear
+# W16A16
+w = torch.randn(11008, 4096, device="cuda", dtype=torch.bfloat16)
+y = L.gemm(x, w)
+
+# W8A16, per-channel weight scale
+w8 = w.to(torch.float8_e4m3fn)
+y = L.gemm(x, w8, w_scale=torch.ones(11008, device="cuda"))
+
+# W8A8 FP8, dynamic per-token activation scale
+xq, xs = L.quantize_fp8(x)
+y = L.gemm(xq, w8, x_scale=xs, w_scale=torch.ones(11008, device="cuda"))
+
+# W8A8 INT8
+xq, xs = L.quantize_int8(x)
+y = L.gemm(xq, w_int8, x_scale=xs, w_scale=w_int8_scale)
+
+# NVFP4 weight + block scales ([N, K/16] e4m3), global scale as w_scale
+y = L.gemm(x, w_fp4, w_block_scale=w_sf, w_scale=weight_scale_2)           # W4A16
+g = torch.tensor([global_scale], device="cuda")
+xq, x_sf = L.quantize_nvfp4(x, g)
+y = L.gemm(xq, w_fp4, x_block_scale=x_sf, w_block_scale=w_sf,
+           x_scale=1 / global_scale, w_scale=weight_scale_2)               # W4A4
 ```
 
-Inputs: `x` is `[..., K]` with 1-16 rows, unit last-dim stride, row stride a multiple of 8, 16-byte aligned;
-`w` is `[N, K]` with the same constraints; `K % 8 == 0`.
+| Argument | Meaning |
+|---|---|
+| `x_scale` | float, or float32 tensor with 1 or M elements |
+| `w_scale` | float, or float32 tensor with 1 or N elements |
+| `x_block_scale`, `w_block_scale` | NVFP4 block scales, `[rows, K/16]` float8_e4m3fn |
+| `alpha` | float, or 1-element float32 tensor (stays valid inside CUDA graphs) |
+| `bias` | `[N]` bf16 / f16 / f32 |
+| `out_dtype` | bf16 (default for quantized inputs), f16, f32 |
+| `out` | preallocated `[M, N]` output |
+
+FP4 tensors are `torch.float4_e2m1fn_x2` (or `uint8` together with a block scale), two values per byte, low
+nibble first, shape `[rows, K/2]`. K must be a multiple of 8 (16-bit), 16 (8-bit) or 64 (FP4); rows must be
+16-byte aligned. `L.supports(x, w)` checks this.
 
 ### Plans
 
-A plan per `(N, K)` holds the summation order (`lanes_per_row`, `ksplit`) and a tile per token count
-(`rows`, `unroll`, `warps`). Lookup order: `set_plan()`, then the plan file in `LLG_PLAN_FILE`, then a packaged
-plan for the device, then a built-in heuristic.
-
 ```python
-from lowlat_gemm import Plan, Tile
-lowlat_gemm.set_plan(336, 10240, Plan(lanes_per_row=32, ksplit=8, tiles={1: Tile(1, 8, 4), 4: Tile(2, 4, 4)}))
-lowlat_gemm.load_plans("plans.json")
+from lowlat_gemm import Plan, TcChoice
+L.set_plan("bf16", 11008, 4096, Plan(tc={1: TcChoice(cfg=0, swap=True, stages=6, ksplit=4)}))
+L.load_plans("plans.json")
 ```
 
-Split-K plans use a per-device workspace. Before capturing a CUDA graph, size it once:
+Lookup order: `set_plan()`, the file in `LLG_PLAN_FILE`, a packaged plan for the device, built-in heuristics.
+Before capturing a CUDA graph, size the split-K workspace:
 
 ```python
-lowlat_gemm.reserve_workspace(torch.device("cuda", 0), floats=ksplit * 16 * N, counters=N)
+L.reserve_workspace(torch.device("cuda", 0), *L.workspace_need("bf16", 11008, 4096, max_m=16))
 ```
 
-### Tuning and benchmarks
+### Tuning, benchmarks, tests
 
 ```bash
-python tools/tune.py  --shapes shapes/qwen3.8-flash-next-tp1.json --out plans.json
-python tools/bench.py --shapes shapes/qwen3.8-flash-next-tp1.json --plans plans.json
+python tools/tune.py  --shapes shapes/qwen3.8-flash-next-tp1.json --kinds bf16,fp8,nvfp4 --out plans.json
+python tools/bench.py --shapes shapes/qwen3.8-flash-next-tp1.json --kinds bf16,fp8,nvfp4 --plans plans.json
 pytest tests
+python tests/emulate_tc.py        # CPU thread-level emulation of the tensor-core kernel's indexing
 ```
 
-A shape file lists `{"name", "n", "k"}` entries. Timings replay a CUDA graph over weight copies that together
-exceed the L2 cache, so every call reads its weight from DRAM.
+A shape file lists `{"name", "n", "k"}` entries.
 
 ## vLLM
 
-Installing the package registers a `vllm.general_plugins` entry point; it does nothing unless enabled.
+Installing the package registers a `vllm.general_plugins` entry point that does nothing unless enabled.
 
 ```bash
 LLG_VLLM=1 LLG_PLAN_FILE=plans.json vllm serve <Qwen3.8-Flash-Next checkpoint> ...
 ```
 
 On SM120 it routes the model's unquantized BF16 projections and LM head (and the MTP drafter's) to
-`lowlat_gemm` for batches of up to 16 tokens; larger batches, biased layers and `VLLM_BATCH_INVARIANT=1` keep
-vLLM's implementation.
+`lowlat_gemm` for batches up to `LLG_VLLM_MAX_TOKENS` (default 16).
 
 | Variable | Meaning |
 |---|---|
 | `LLG_VLLM=1` | enable the plugin |
 | `LLG_VLLM_MODELS` | hook targets, `,`-separated (default `qwen4_exp`) |
+| `LLG_VLLM_MAX_TOKENS` | largest batch routed to lowlat_gemm (default 16) |
 | `LLG_PLAN_FILE` | plan file from `tools/tune.py` |
 
 ## License

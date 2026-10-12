@@ -17,7 +17,11 @@ template <int MT, int R, int U, int LPR>
 void launch_one(const Params& p, const LaunchConfig& c, cudaStream_t stream) {
   const int rows_per_block = c.warps * (32 / LPR) * R;
   const dim3 grid((p.N + rows_per_block - 1) / rows_per_block, c.ksplit);
-  gemv_kernel<MT, R, U, LPR><<<grid, c.warps * 32, 0, stream>>>(p);
+  if (p.f16) {
+    gemv_kernel<MT, R, U, LPR, true><<<grid, c.warps * 32, 0, stream>>>(p);
+  } else {
+    gemv_kernel<MT, R, U, LPR, false><<<grid, c.warps * 32, 0, stream>>>(p);
+  }
 }
 
 // (R, U) pairs with R * U <= 8 keep the in-flight weight vectors at <= 32 registers per lane.

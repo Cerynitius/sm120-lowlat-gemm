@@ -8,15 +8,16 @@
 namespace llg {
 
 struct Params {
-  const void* x;       // bf16 [M, K], row stride ldx (elements), unit column stride
-  const void* w;       // bf16 [N, K], row stride ldw
-  void* y;             // [M, N], row stride ldy; bf16, or fp32 when out_fp32
+  const void* x;       // bf16 or f16 [M, K], row stride ldx (elements), unit column stride
+  const void* w;       // same type [N, K], row stride ldw
+  void* y;             // [M, N], row stride ldy; input type, or fp32 when out_fp32
   int64_t ldx, ldw, ldy;
   int M, N, K;
   int ksplit;
   float* ws;           // [ksplit, M, N] partial sums (ksplit > 1)
   unsigned* counters;  // one arrival counter per block column, zero between launches
   bool out_fp32;
+  bool f16;            // x, w (and a 16-bit y) are f16 instead of bf16
 };
 
 struct LaunchConfig {

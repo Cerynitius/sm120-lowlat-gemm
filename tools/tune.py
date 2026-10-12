@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Search plans for a shape list and write a plan file (load with LLG_PLAN_FILE or lowlat_gemm.load_plans).
+"""Measure plans for a shape list and write a plan file (load with LLG_PLAN_FILE or lowlat_gemm.load_plans).
 
-    python tools/tune.py --shapes shapes/qwen3.8-flash-next-tp1.json --out plans.json [--tokens 1,2,3,4,6,8,16]
+    python tools/tune.py --shapes shapes/qwen3.8-flash-next-tp1.json --kinds bf16,nvfp4 --out plans.json \
+        [--tokens 1,2,3,4,8,16,32,64,128,256]
 
-Per (N, K) the summation order (lanes_per_row, ksplit) is chosen once for all M, so results stay bit-identical
-across token counts; only the tile (rows, unroll, warps) is chosen per M.
-Stage 1 ranks every (lanes_per_row, ksplit) by its best tile at the --rank-tokens counts; stage 2 searches all
-tiles for every token count on the --finalists best orders and keeps the order with the lowest summed time.
+Tensor-core: every (config, orientation, stages, K split) is timed per token count and the fastest kept.
+Skinny (W16A16): the summation order (lanes_per_row, K split) is chosen once per (N, K) -- so results stay
+bit-identical across token counts -- and the tile per token count; skinny serves the token counts where it beats
+the tensor-core choice, up to the first count where it does not.
 """
 
 from __future__ import annotations
@@ -20,87 +21,101 @@ import sys
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import lowlat_gemm  # noqa: E402
-from lowlat_gemm import Plan, Tile  # noqa: E402
-from timing import ColdWeights, time_per_call  # noqa: E402
+import lowlat_gemm as L  # noqa: E402
+from common import ColdWeights, make_input, time_per_call  # noqa: E402
+from lowlat_gemm import Plan, SkinnyOrder, SkinnyTile, TcChoice  # noqa: E402
 
-TILES = [Tile(r, u, wp) for (r, u), wp in itertools.product(sorted(lowlat_gemm._RU_PAIRS), (2, 4, 8))]
-KSPLITS = (1, 2, 3, 4, 6, 8, 12, 16)
+SKINNY_TILES = [SkinnyTile(r, u, w) for (r, u), w in itertools.product([(1, 2), (1, 4), (1, 8), (2, 2), (2, 4), (4, 2)], (2, 4, 8))]
+KSPLITS = (1, 2, 4, 8, 16)
 
 
-def orders(k: int):
-    kv = k // 8
-    for lanes in (32, 16, 8):
-        if kv < lanes and lanes != 8:
+def tc_candidates(kind: str, m: int, n: int, k: int):
+    nk = -(-k // L.KINDS[kind][1])
+    for cfg in range(L.NUM_CFGS):
+        top = L.max_stages(kind, cfg)
+        if top < 2:
             continue
-        for ks in KSPLITS:
-            if ks == 1 or kv // ks >= lanes:
-                yield lanes, ks
-
-
-def best_tile(x, out, cold, lanes, ks, m):
-    best = (float("inf"), None)
-    for tile in TILES:
-        plan = Plan(lanes_per_row=lanes, ksplit=ks, default_tile=tile)
-        t = time_per_call(lambda w: lowlat_gemm.gemm(x, w, out=out, plan=plan), cold, replays=7)
-        best = min(best, (t, tile), key=lambda b: b[0])
-    return best
+        for swap in ((True,) if kind in L._MIXED else (True, False)):
+            bp, bq, _, _ = L.tc_info(kind, cfg)
+            p, q = (n, m) if swap else (m, n)
+            if bq > 2 * q and bq > 8:  # tile far wider than the problem: skip
+                continue
+            for stages in sorted({2, min(3, top), min(4, top), top}):
+                for ks in KSPLITS:
+                    if ks > 1 and nk // ks < 2:
+                        continue
+                    yield TcChoice(cfg=cfg, swap=swap, stages=stages, ksplit=ks)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--shapes", required=True)
+    ap.add_argument("--kinds", default="bf16")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--tokens", default="1,2,3,4,6,8,16")
-    ap.add_argument("--rank-tokens", default="1,4")
-    ap.add_argument("--finalists", type=int, default=3)
+    ap.add_argument("--tokens", default="1,2,3,4,8,16,32,64,128,256")
+    ap.add_argument("--replays", type=int, default=7)
     args = ap.parse_args()
 
-    device = torch.device("cuda", torch.cuda.current_device())
+    dev = torch.device("cuda", torch.cuda.current_device())
     tokens = [int(t) for t in args.tokens.split(",")]
-    rank_tokens = [int(t) for t in args.rank_tokens.split(",")]
     shapes = json.load(open(args.shapes))["shapes"]
     max_n = max(s["n"] for s in shapes)
-    lowlat_gemm.reserve_workspace(device, max(KSPLITS) * max(tokens + rank_tokens) * max_n, max_n)
-    result = {"device": torch.cuda.get_device_name(device), "shapes": {}}
-    for s in shapes:
-        n, k = s["n"], s["k"]
-        key = f"{n}x{k}"
-        if key in result["shapes"]:
-            continue
-        cold = ColdWeights(n, k, device)
-        xs = {m: torch.randn(m, k, device=device).to(torch.bfloat16) for m in tokens + rank_tokens}
-        outs = {m: torch.empty(m, n, device=device, dtype=torch.bfloat16) for m in xs}
-        ranked = []
-        for lanes, ks in orders(k):
-            total = sum(best_tile(xs[m], outs[m], cold, lanes, ks, m)[0] for m in rank_tokens)
-            ranked.append((total, lanes, ks))
-        ranked.sort()
-        best = None
-        for _, lanes, ks in ranked[: args.finalists]:
-            tiles, total = {}, 0.0
+    L.reserve_workspace(dev, max(KSPLITS) * max(tokens) * max_n, max_n)
+    plans: dict[tuple[str, int, int], Plan] = {}
+    for kind in args.kinds.split(","):
+        for s in shapes:
+            n, k = s["n"], s["k"]
+            if (kind, n, k) in plans or k % L.KINDS[kind][2]:
+                continue
+            cold = ColdWeights(kind, n, k, dev)
+            plan = Plan()
+            tc_us = {}
             for m in tokens:
-                t, tile = best_tile(xs[m], outs[m], cold, lanes, ks, m)
-                tiles[m], total = tile, total + t
-            if best is None or total < best[0]:
-                best = (total, Plan(lanes_per_row=lanes, ksplit=ks, tiles=tiles, default_tile=tiles[max(tokens)]))
-        plan = best[1]
-        cublas = {}
-        for m in tokens:
-            x = xs[m]
-            cublas[m] = time_per_call(lambda w: torch.nn.functional.linear(x, w), cold, replays=7)
-        entry = plan.to_json()
-        entry["us"] = {
-            str(m): round(time_per_call(lambda w: lowlat_gemm.gemm(xs[m], w, out=outs[m], plan=plan), cold), 3)
-            for m in tokens
-        }
-        entry["cublas_us"] = {str(m): round(t, 3) for m, t in cublas.items()}
-        result["shapes"][key] = entry
-        print(f"{s['name']:28s} {key:>13s} lanes={plan.lanes_per_row:2d} ksplit={plan.ksplit:2d} "
-              + " ".join(f"M{m}:{entry['us'][str(m)]:.1f}/{cublas[m]:.1f}" for m in tokens), flush=True)
-        del cold, xs, outs
-        torch.cuda.empty_cache()
-        json.dump(result, open(args.out, "w"), indent=1)
+                x, x_kw = make_input(kind, m, k, dev)
+                out = torch.empty(m, n, device=dev, dtype=torch.float16 if kind == "f16" or kind.endswith("_f16") else torch.bfloat16)
+                best = None
+                for c in tc_candidates(kind, m, n, k):
+                    t = time_per_call(lambda w, kw: L.gemm(x, w, out=out, plan=Plan(tc={1: c}), **kw, **x_kw), cold,
+                                      replays=args.replays)
+                    if best is None or t < best[0]:
+                        best = (t, c)
+                tc_us[m], plan.tc[m] = best
+            if kind in ("bf16", "f16"):
+                skinny_ms = [m for m in tokens if m <= L.SKINNY_MAX_TOKENS]
+                best_order = None
+                kv = k // 8
+                for lanes, ks in itertools.product((32, 16, 8), (1, 2, 4, 8, 16)):
+                    if ks > 1 and kv // ks < lanes:
+                        continue
+                    tiles, total = {}, 0.0
+                    for m in skinny_ms:
+                        x, _ = make_input(kind, m, k, dev)
+                        out = torch.empty(m, n, device=dev, dtype=x.dtype)
+                        bt = None
+                        for tile in SKINNY_TILES:
+                            order = SkinnyOrder(lanes_per_row=lanes, ksplit=ks, default_tile=tile)
+                            pl = Plan(skinny=order, skinny_max_m=L.SKINNY_MAX_TOKENS)
+                            t = time_per_call(lambda w, kw: L.gemm(x, w, out=out, plan=pl), cold, replays=args.replays)
+                            if bt is None or t < bt[0]:
+                                bt = (t, tile)
+                        tiles[m] = bt
+                        total += bt[0]
+                    if best_order is None or total < best_order[0]:
+                        best_order = (total, lanes, ks, tiles)
+                _, lanes, ks, tiles = best_order
+                plan.skinny = SkinnyOrder(lanes_per_row=lanes, ksplit=ks, tiles={m: t for m, (_, t) in tiles.items()})
+                plan.skinny_max_m = 0
+                for m in skinny_ms:
+                    if tiles[m][0] < tc_us[m]:
+                        plan.skinny_max_m = m
+                    else:
+                        break
+            plans[(kind, n, k)] = plan
+            summary = " ".join(f"M{m}:{tc_us[m]:.1f}" for m in tokens)
+            print(f"{kind:11s} {s['name'][:26]:26s} {n}x{k}  tc[{summary}]  skinny<= {plan.skinny_max_m}", flush=True)
+            L.save_plans(args.out, plans, torch.cuda.get_device_name(dev))
+            del cold
+            torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

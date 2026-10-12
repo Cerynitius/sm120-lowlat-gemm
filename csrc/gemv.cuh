@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Skinny BF16 GEMM for decode-sized batches: y[M, N] = x[M, K] @ w[N, K]^T, M <= 16.
+// Skinny BF16/FP16 GEMM for decode-sized batches: y[M, N] = x[M, K] @ w[N, K]^T, M <= 16.
 //
 // The weight is streamed once from DRAM in 16-byte vectors (L1 bypass, 256B L2 prefetch); x is small and
 // re-read through L1. Accumulation is fp32 FMA in a fixed order, so the result for one row of x does not
@@ -13,6 +13,7 @@
 #pragma once
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <stdint.h>
 
 #include "params.h"
@@ -33,16 +34,34 @@ __device__ __forceinline__ void widen(uint32_t u, float& lo, float& hi) {
   hi = __uint_as_float(u & 0xffff0000u);
 }
 
-__device__ __forceinline__ void widen8(const uint4& v, float (&f)[8]) {
-  widen(v.x, f[0], f[1]);
-  widen(v.y, f[2], f[3]);
-  widen(v.z, f[4], f[5]);
-  widen(v.w, f[6], f[7]);
+// Exact f16 -> fp32 widening of the two halves of a 32-bit word.
+__device__ __forceinline__ void widen_h(uint32_t u, float& lo, float& hi) {
+  const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&u));
+  lo = f.x;
+  hi = f.y;
 }
 
+template <bool F16>
+__device__ __forceinline__ void widen8(const uint4& v, float (&f)[8]) {
+  if constexpr (F16) {
+    widen_h(v.x, f[0], f[1]);
+    widen_h(v.y, f[2], f[3]);
+    widen_h(v.z, f[4], f[5]);
+    widen_h(v.w, f[6], f[7]);
+  } else {
+    widen(v.x, f[0], f[1]);
+    widen(v.y, f[2], f[3]);
+    widen(v.z, f[4], f[5]);
+    widen(v.w, f[6], f[7]);
+  }
+}
+
+template <bool F16>
 __device__ __forceinline__ void store_out(const Params& p, int m, int n, float v) {
   if (p.out_fp32) {
     static_cast<float*>(p.y)[(int64_t)m * p.ldy + n] = v;
+  } else if constexpr (F16) {
+    static_cast<__half*>(p.y)[(int64_t)m * p.ldy + n] = __float2half_rn(v);
   } else {
     static_cast<__nv_bfloat16*>(p.y)[(int64_t)m * p.ldy + n] = __float2bfloat16_rn(v);
   }
@@ -50,7 +69,7 @@ __device__ __forceinline__ void store_out(const Params& p, int m, int n, float v
 
 // MT: token capacity (runtime M <= MT). R: rows per row group. U: vectors in flight per row and lane.
 // LPR: lanes per row group (8, 16 or 32); a warp holds 32 / LPR row groups.
-template <int MT, int R, int U, int LPR>
+template <int MT, int R, int U, int LPR, bool F16>
 __global__ void __launch_bounds__(256) gemv_kernel(const Params p) {
   constexpr int GROUPS = 32 / LPR;
   const int lane = threadIdx.x & 31;
@@ -98,12 +117,12 @@ __global__ void __launch_bounds__(256) gemv_kernel(const Params p) {
       if (v < vend) {
         float wf[R][8];
 #pragma unroll
-        for (int r = 0; r < R; ++r) widen8(wv[u][r], wf[r]);
+        for (int r = 0; r < R; ++r) widen8<F16>(wv[u][r], wf[r]);
 #pragma unroll
         for (int m = 0; m < MT; ++m) {
           if (m < p.M) {
             float xf[8];
-            widen8(__ldg(reinterpret_cast<const uint4*>(xp + (int64_t)m * p.ldx + (int64_t)v * 8)), xf);
+            widen8<F16>(__ldg(reinterpret_cast<const uint4*>(xp + (int64_t)m * p.ldx + (int64_t)v * 8)), xf);
 #pragma unroll
             for (int r = 0; r < R; ++r)
 #pragma unroll
@@ -127,7 +146,7 @@ __global__ void __launch_bounds__(256) gemv_kernel(const Params p) {
     for (int r = 0; r < R; ++r)
 #pragma unroll
       for (int m = 0; m < MT; ++m)
-        if (sl == (r * MT + m) % LPR && m < p.M && rvalid[r]) store_out(p, m, row0 + r, acc[r][m]);
+        if (sl == (r * MT + m) % LPR && m < p.M && rvalid[r]) store_out<F16>(p, m, row0 + r, acc[r][m]);
     return;
   }
 
@@ -156,7 +175,7 @@ __global__ void __launch_bounds__(256) gemv_kernel(const Params p) {
     const int n = block_row0 + i % nrows;
     float s = __ldcg(&p.ws[(int64_t)m * p.N + n]);
     for (int k = 1; k < p.ksplit; ++k) s += __ldcg(&p.ws[((int64_t)k * p.M + m) * p.N + n]);
-    store_out(p, m, n, s);
+    store_out<F16>(p, m, n, s);
   }
   if (threadIdx.x == 0) p.counters[blockIdx.x] = 0u;
 }

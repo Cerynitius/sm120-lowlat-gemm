@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <atomic>
+
 #include "tc_gemm.cuh"
 
 namespace llg {
@@ -52,6 +54,23 @@ void tc_cfg_tile(int cfg, int* bp, int* bq, int* threads) {
     case 7: tile_of<7>(bp, bq, threads); break;
     default: *bp = *bq = *threads = 0;
   }
+}
+
+}  // namespace llg
+
+namespace llg {
+
+static std::atomic<bool> g_pdl{false};
+
+bool pdl_enabled() { return g_pdl.load(std::memory_order_relaxed); }
+void set_pdl_flag(bool on) { g_pdl.store(on, std::memory_order_relaxed); }
+
+int sm_count_current() {
+  static int counts[64] = {};
+  int dev = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return 0;
+  if (counts[dev] == 0) cudaDeviceGetAttribute(&counts[dev], cudaDevAttrMultiProcessorCount, dev);
+  return counts[dev];
 }
 
 }  // namespace llg

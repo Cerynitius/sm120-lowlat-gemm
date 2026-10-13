@@ -22,7 +22,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import lowlat_gemm as L  # noqa: E402
-from common import ColdWeights, make_input, time_per_call  # noqa: E402
+from common import ColdWeights, make_input, producer, time_per_call  # noqa: E402
 from lowlat_gemm import Plan, SkinnyOrder, SkinnyTile, TcChoice  # noqa: E402
 
 SKINNY_TILES = [SkinnyTile(r, u, w) for (r, u), w in itertools.product([(1, 2), (1, 4), (1, 8), (2, 2), (2, 4), (4, 2)], (2, 4, 8))]
@@ -45,6 +45,8 @@ def tc_candidates(kind: str, m: int, n: int, k: int):
                     if ks > 1 and nk // ks < 2:
                         continue
                     yield TcChoice(cfg=cfg, swap=swap, stages=stages, ksplit=ks)
+                    if 1 < ks <= 8 and bp * bq * 4 <= 99 * 1024 - 128:
+                        yield TcChoice(cfg=cfg, swap=swap, stages=stages, ksplit=ks, cluster=True)
 
 
 def main() -> None:
@@ -56,9 +58,13 @@ def main() -> None:
     ap.add_argument("--replays", type=int, default=7)
     ap.add_argument("--max-calls", type=int, default=0,
                     help="cap the calls per timed graph (faster tuning; weights may then partly stay in L2)")
+    ap.add_argument("--pdl", action="store_true", help="programmatic dependent launch (lowlat_gemm.set_pdl)")
+    ap.add_argument("--between", choices=("none", "write"), default="none",
+                    help="write: time each GEMM after a small kernel that rewrites x (as in a decode step)")
     args = ap.parse_args()
 
     dev = torch.device("cuda", torch.cuda.current_device())
+    L.set_pdl(args.pdl)
     tokens = [int(t) for t in args.tokens.split(",")]
     shapes = json.load(open(args.shapes))["shapes"]
     max_n = max(s["n"] for s in shapes)
@@ -78,8 +84,9 @@ def main() -> None:
                 out = torch.empty(m, n, device=dev, dtype=torch.float16 if kind == "f16" or kind.endswith("_f16") else torch.bfloat16)
                 best = None
                 for c in tc_candidates(kind, m, n, k):
-                    t = time_per_call(lambda w, kw: L.gemm(x, w, out=out, plan=Plan(tc={m: c}), **kw, **x_kw), cold,
-                                      calls=calls, replays=args.replays)
+                    t = time_per_call(lambda w, kw, nxt: L.gemm(x, w, out=out, plan=Plan(tc={m: c}), **kw, **x_kw), cold,
+                                      calls=calls, replays=args.replays,
+                                      before=producer(x) if args.between == "write" else None)
                     if best is None or t < best[0]:
                         best = (t, c)
                 tc_us[m], plan.tc[m] = best
@@ -87,8 +94,8 @@ def main() -> None:
                 skinny_ms = [m for m in tokens if m <= L.SKINNY_MAX_TOKENS]
                 best_order = None
                 kv = k // 8
-                for lanes, ks in itertools.product((32, 16, 8), (1, 2, 4, 8, 16)):
-                    if ks > 1 and kv // ks < lanes:
+                for lanes, ks, clu in itertools.product((32, 16, 8), (1, 2, 4, 8, 16), (False, True)):
+                    if (ks > 1 and kv // ks < lanes) or (clu and not 1 < ks <= 8):
                         continue
                     tiles, total = {}, 0.0
                     for m in skinny_ms:
@@ -96,17 +103,19 @@ def main() -> None:
                         out = torch.empty(m, n, device=dev, dtype=x.dtype)
                         bt = None
                         for tile in SKINNY_TILES:
-                            order = SkinnyOrder(lanes_per_row=lanes, ksplit=ks, default_tile=tile)
+                            order = SkinnyOrder(lanes_per_row=lanes, ksplit=ks, default_tile=tile, cluster=clu)
                             pl = Plan(skinny=order, skinny_max_m=L.SKINNY_MAX_TOKENS)
-                            t = time_per_call(lambda w, kw: L.gemm(x, w, out=out, plan=pl), cold, calls=calls, replays=args.replays)
+                            t = time_per_call(lambda w, kw, nxt: L.gemm(x, w, out=out, plan=pl), cold, calls=calls, replays=args.replays,
+                                      before=producer(x) if args.between == "write" else None)
                             if bt is None or t < bt[0]:
                                 bt = (t, tile)
                         tiles[m] = bt
                         total += bt[0]
                     if best_order is None or total < best_order[0]:
-                        best_order = (total, lanes, ks, tiles)
-                _, lanes, ks, tiles = best_order
-                plan.skinny = SkinnyOrder(lanes_per_row=lanes, ksplit=ks, tiles={m: t for m, (_, t) in tiles.items()})
+                        best_order = (total, lanes, ks, clu, tiles)
+                _, lanes, ks, clu, tiles = best_order
+                plan.skinny = SkinnyOrder(lanes_per_row=lanes, ksplit=ks, cluster=clu,
+                                          tiles={m: t for m, (_, t) in tiles.items()})
                 plan.skinny_max_m = 0
                 for m in skinny_ms:
                     if tiles[m][0] < tc_us[m]:

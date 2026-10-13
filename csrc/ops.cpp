@@ -32,6 +32,19 @@ void check_same_device(const at::Tensor& ref, const at::Tensor& t, const char* n
 
 constexpr int64_t kSkinnyMaxTokens = 16;
 
+// Validates an optional L2 prefetch range: the first `bytes` (0 = all) of a tensor's storage span.
+void set_prefetch(const void*& ptr, int64_t& n, const std::optional<at::Tensor>& t, int64_t bytes, const at::Tensor& ref) {
+  ptr = nullptr;
+  n = 0;
+  if (!t.has_value()) return;
+  check_same_device(ref, *t, "prefetch");
+  TORCH_CHECK(t->is_contiguous() && aligned(t->data_ptr(), 16), "lowlat_gemm: prefetch tensor must be contiguous and "
+              "16-byte aligned");
+  const int64_t total = t->numel() * t->element_size();
+  ptr = t->data_ptr();
+  n = bytes > 0 && bytes < total ? bytes : total;
+}
+
 void skinny_check_config(int64_t rows, int64_t unroll, int64_t lanes_per_row, int64_t warps, int64_t ksplit) {
   const int64_t ru = rows * 16 + unroll;
   TORCH_CHECK(ru == 18 || ru == 20 || ru == 24 || ru == 34 || ru == 36 || ru == 66,
@@ -45,7 +58,7 @@ void skinny_check_config(int64_t rows, int64_t unroll, int64_t lanes_per_row, in
 
 void skinny_run(const at::Tensor& y, const at::Tensor& x, const at::Tensor& w, const at::Tensor& ws,
                 const at::Tensor& counters, int64_t rows, int64_t unroll, int64_t lanes_per_row, int64_t warps,
-                int64_t ksplit) {
+                int64_t ksplit, bool cluster, const std::optional<at::Tensor>& prefetch, int64_t prefetch_bytes) {
   skinny_check_config(rows, unroll, lanes_per_row, warps, ksplit);
   TORCH_CHECK(x.is_cuda(), "lowlat_gemm: x must be on CUDA");
   check_same_device(x, w, "w");
@@ -70,7 +83,9 @@ void skinny_run(const at::Tensor& y, const at::Tensor& x, const at::Tensor& w, c
   TORCH_CHECK(aligned(x.data_ptr(), 16) && aligned(w.data_ptr(), 16), "lowlat_gemm: x and w must be 16-byte aligned");
   const int64_t rows_per_block = warps * (32 / lanes_per_row) * rows;
   const int64_t columns = (n + rows_per_block - 1) / rows_per_block;
-  if (ksplit > 1) {
+  cluster = cluster && ksplit > 1;
+  TORCH_CHECK(!cluster || ksplit <= 8, "lowlat_gemm: cluster split-K supports ksplit <= 8, got ", ksplit);
+  if (ksplit > 1 && !cluster) {
     check_same_device(x, ws, "workspace");
     check_same_device(x, counters, "counters");
     TORCH_CHECK(ws.scalar_type() == at::kFloat && ws.is_contiguous() && counters.scalar_type() == at::kInt &&
@@ -92,10 +107,12 @@ void skinny_run(const at::Tensor& y, const at::Tensor& x, const at::Tensor& w, c
   p.N = static_cast<int>(n);
   p.K = static_cast<int>(k);
   p.ksplit = static_cast<int>(ksplit);
-  p.ws = ksplit > 1 ? ws.data_ptr<float>() : nullptr;
-  p.counters = ksplit > 1 ? reinterpret_cast<unsigned*>(counters.data_ptr<int>()) : nullptr;
+  p.ws = ksplit > 1 && !cluster ? ws.data_ptr<float>() : nullptr;
+  p.counters = ksplit > 1 && !cluster ? reinterpret_cast<unsigned*>(counters.data_ptr<int>()) : nullptr;
   p.out_fp32 = y.scalar_type() == at::kFloat;
   p.f16 = in_t == at::kHalf;
+  p.cluster = cluster;
+  set_prefetch(p.pf, p.pf_bytes, prefetch, prefetch_bytes, x);
 
   LaunchConfig c{static_cast<int>(rows), static_cast<int>(unroll), static_cast<int>(lanes_per_row),
                  static_cast<int>(warps), static_cast<int>(ksplit)};
@@ -185,7 +202,8 @@ void tc_gemm_impl(at::Tensor& y, const at::Tensor& a, const at::Tensor& b, const
                   const std::optional<at::Tensor>& b_sf, const std::optional<at::Tensor>& row_scale,
                   const std::optional<at::Tensor>& col_scale, const std::optional<at::Tensor>& bias,
                   const std::optional<at::Tensor>& alpha_t, double alpha, int64_t kind, bool swap, bool bias_on_p,
-                  int64_t cfg, int64_t stages, int64_t ksplit, const at::Tensor& ws, const at::Tensor& counters) {
+                  int64_t cfg, int64_t stages, int64_t ksplit, const at::Tensor& ws, const at::Tensor& counters,
+                  bool cluster, const std::optional<at::Tensor>& prefetch, int64_t prefetch_bytes) {
   const KindInfo ki = kind_info(kind);
   TORCH_CHECK(cfg >= 0 && cfg < kNumCfgs, "lowlat_gemm: cfg must be in [0, ", kNumCfgs, "), got ", cfg);
   TORCH_CHECK(ksplit >= 1 && ksplit <= 64, "lowlat_gemm: ksplit must be in [1, 64], got ", ksplit);
@@ -253,7 +271,10 @@ void tc_gemm_impl(at::Tensor& y, const at::Tensor& a, const at::Tensor& b, const
   p.K = static_cast<int>(K);
   p.ksplit = static_cast<int>(ksplit);
   p.stages = static_cast<int>(stages);
-  if (ksplit > 1) {
+  p.cluster = cluster && ksplit > 1;
+  set_prefetch(p.pf, p.pf_bytes, prefetch, prefetch_bytes, a);
+  TORCH_CHECK(!p.cluster || ksplit <= 8, "lowlat_gemm: cluster split-K supports ksplit <= 8, got ", ksplit);
+  if (ksplit > 1 && !p.cluster) {
     int bp, bq, threads;
     tc_cfg_tile(static_cast<int>(cfg), &bp, &bq, &threads);
     const int64_t tiles = ((P + bp - 1) / bp) * ((Q + bq - 1) / bq);
@@ -350,20 +371,22 @@ void quant_impl(const at::Tensor& x, at::Tensor& q, const std::optional<at::Tens
 // ---- registered entry points -----------------------------------------------------------------------------------
 
 at::Tensor skinny(const at::Tensor& x, const at::Tensor& w, const at::Tensor& ws, const at::Tensor& counters,
-                  int64_t rows, int64_t unroll, int64_t lanes_per_row, int64_t warps, int64_t ksplit, bool out_fp32) {
+                  int64_t rows, int64_t unroll, int64_t lanes_per_row, int64_t warps, int64_t ksplit, bool out_fp32,
+                  bool cluster, const std::optional<at::Tensor>& prefetch, int64_t prefetch_bytes) {
   auto y = at::empty({x.size(0), w.size(0)}, x.options().dtype(out_fp32 ? at::kFloat : x.scalar_type()));
-  skinny_run(y, x, w, ws, counters, rows, unroll, lanes_per_row, warps, ksplit);
+  skinny_run(y, x, w, ws, counters, rows, unroll, lanes_per_row, warps, ksplit, cluster, prefetch, prefetch_bytes);
   return y;
 }
 
 void skinny_out(at::Tensor& y, const at::Tensor& x, const at::Tensor& w, const at::Tensor& ws,
                 const at::Tensor& counters, int64_t rows, int64_t unroll, int64_t lanes_per_row, int64_t warps,
-                int64_t ksplit) {
-  skinny_run(y, x, w, ws, counters, rows, unroll, lanes_per_row, warps, ksplit);
+                int64_t ksplit, bool cluster, const std::optional<at::Tensor>& prefetch, int64_t prefetch_bytes) {
+  skinny_run(y, x, w, ws, counters, rows, unroll, lanes_per_row, warps, ksplit, cluster, prefetch, prefetch_bytes);
 }
 
 at::Tensor skinny_meta(const at::Tensor& x, const at::Tensor& w, const at::Tensor&, const at::Tensor&, int64_t,
-                       int64_t, int64_t, int64_t, int64_t, bool out_fp32) {
+                       int64_t, int64_t, int64_t, int64_t, bool out_fp32, bool, const std::optional<at::Tensor>&,
+                       int64_t) {
   return at::empty({x.size(0), w.size(0)}, x.options().dtype(out_fp32 ? at::kFloat : x.scalar_type()));
 }
 
@@ -371,9 +394,10 @@ void tc_gemm(at::Tensor& y, const at::Tensor& a, const at::Tensor& b, const std:
              const std::optional<at::Tensor>& b_sf, const std::optional<at::Tensor>& row_scale,
              const std::optional<at::Tensor>& col_scale, const std::optional<at::Tensor>& bias,
              const std::optional<at::Tensor>& alpha_t, double alpha, int64_t kind, bool swap, bool bias_on_p,
-             int64_t cfg, int64_t stages, int64_t ksplit, const at::Tensor& ws, const at::Tensor& counters) {
+             int64_t cfg, int64_t stages, int64_t ksplit, const at::Tensor& ws, const at::Tensor& counters,
+             bool cluster, const std::optional<at::Tensor>& prefetch, int64_t prefetch_bytes) {
   tc_gemm_impl(y, a, b, a_sf, b_sf, row_scale, col_scale, bias, alpha_t, alpha, kind, swap, bias_on_p, cfg, stages,
-               ksplit, ws, counters);
+               ksplit, ws, counters, cluster, prefetch, prefetch_bytes);
 }
 
 void quant(const at::Tensor& x, at::Tensor& q, const std::optional<at::Tensor>& sf,
@@ -381,6 +405,9 @@ void quant(const at::Tensor& x, at::Tensor& q, const std::optional<at::Tensor>& 
            double min_scale) {
   quant_impl(x, q, sf, scale_in, scale_out, mode, min_scale);
 }
+
+void set_pdl(bool on) { set_pdl_flag(on); }
+bool get_pdl() { return pdl_enabled(); }
 
 std::vector<int64_t> tc_info(int64_t kind, int64_t cfg) {
   int bp, bq, threads;
@@ -393,18 +420,23 @@ std::vector<int64_t> tc_info(int64_t kind, int64_t cfg) {
 TORCH_LIBRARY(lowlat_gemm, m) {
   m.def(
       "skinny(Tensor x, Tensor w, Tensor ws, Tensor counters, int rows, int unroll, int lanes_per_row, "
-      "int warps, int ksplit, bool out_fp32=False) -> Tensor");
+      "int warps, int ksplit, bool out_fp32=False, bool cluster=False, Tensor? prefetch=None, "
+      "int prefetch_bytes=0) -> Tensor");
   m.def(
       "skinny_out(Tensor(a!) y, Tensor x, Tensor w, Tensor ws, Tensor counters, int rows, int unroll, "
-      "int lanes_per_row, int warps, int ksplit) -> ()");
+      "int lanes_per_row, int warps, int ksplit, bool cluster=False, Tensor? prefetch=None, "
+      "int prefetch_bytes=0) -> ()");
   m.def(
       "tc_gemm(Tensor(a!) y, Tensor a, Tensor b, Tensor? a_sf, Tensor? b_sf, Tensor? row_scale, "
       "Tensor? col_scale, Tensor? bias, Tensor? alpha_t, float alpha, int kind, bool swap, bool bias_on_p, "
-      "int cfg, int stages, int ksplit, Tensor ws, Tensor counters) -> ()");
+      "int cfg, int stages, int ksplit, Tensor ws, Tensor counters, bool cluster=False, Tensor? prefetch=None, "
+      "int prefetch_bytes=0) -> ()");
   m.def(
       "quant(Tensor x, Tensor(a!) q, Tensor(b!)? sf, Tensor? scale_in, Tensor(c!)? scale_out, int mode, "
       "float min_scale) -> ()");
   m.def("tc_info(int kind, int cfg) -> int[]", &llg::tc_info);
+  m.def("set_pdl(bool on) -> ()", &llg::set_pdl);
+  m.def("pdl_enabled() -> bool", &llg::get_pdl);
 }
 
 TORCH_LIBRARY_IMPL(lowlat_gemm, CUDA, m) {

@@ -17,10 +17,16 @@ template <int MT, int R, int U, int LPR>
 void launch_one(const Params& p, const LaunchConfig& c, cudaStream_t stream) {
   const int rows_per_block = c.warps * (32 / LPR) * R;
   const dim3 grid((p.N + rows_per_block - 1) / rows_per_block, c.ksplit);
+  Params q = p;
+  q.pdl = pdl_enabled();
+  q.pdl_early = (int64_t)grid.x * grid.y <= sm_count_current();
+  q.cluster = p.cluster && c.ksplit > 1;
+  const size_t smem = q.cluster ? (size_t)rows_per_block * p.M * sizeof(float) : 0;
+  const dim3 cluster(1, q.cluster ? c.ksplit : 1, 1);
   if (p.f16) {
-    gemv_kernel<MT, R, U, LPR, true><<<grid, c.warps * 32, 0, stream>>>(p);
+    launch_kernel(gemv_kernel<MT, R, U, LPR, true>, grid, dim3(c.warps * 32), smem, stream, q.pdl, cluster, q);
   } else {
-    gemv_kernel<MT, R, U, LPR, false><<<grid, c.warps * 32, 0, stream>>>(p);
+    launch_kernel(gemv_kernel<MT, R, U, LPR, false>, grid, dim3(c.warps * 32), smem, stream, q.pdl, cluster, q);
   }
 }
 

@@ -10,6 +10,10 @@ implementation.
     LLG_VLLM_MODELS=...      comma-separated hook targets (default "qwen4_exp")
     LLG_VLLM_MAX_TOKENS=16   largest batch routed to lowlat_gemm
     LLG_PLAN_FILE=...        tuned plan file (tools/tune.py); otherwise the built-in defaults
+    LLG_PDL=1                programmatic dependent launch (weights are fixed during serving; 0 disables)
+    LLG_PREFETCH=1           each routed GEMM pulls the next BF16 projection's weight into L2 (0 disables); the order
+                             is recorded from eager forwards (profiling, capture warm-ups)
+    LLG_PREFETCH_MAX_MB=16   cap on the bytes prefetched per GEMM
 """
 
 from __future__ import annotations
@@ -18,6 +22,23 @@ import logging
 import os
 
 MAX_TOKENS = int(os.environ.get("LLG_VLLM_MAX_TOKENS", "16"))
+PREFETCH = os.environ.get("LLG_PREFETCH", "1") == "1"
+PREFETCH_MAX = int(os.environ.get("LLG_PREFETCH_MAX_MB", "16")) << 20
+
+# forward order of the swapped projections: weight data_ptr -> weight of the projection that runs next
+_next_weight: dict = {}
+_last_weight: list = [None]
+
+
+def _record(w) -> None:
+    import torch
+
+    if torch.cuda.is_current_stream_capturing():
+        return
+    prev = _last_weight[0]
+    if prev is not None and prev is not w:
+        _next_weight.setdefault(prev.data_ptr(), w)
+    _last_weight[0] = w
 
 logger = logging.getLogger("lowlat_gemm")
 
@@ -40,6 +61,8 @@ def _make_methods():
 
     class _Apply:
         def apply(self, layer, x, bias=None):
+            if PREFETCH:
+                _record(layer.weight)
             m = x.numel() // max(1, x.shape[-1])
             if (
                 bias is None
@@ -48,6 +71,10 @@ def _make_methods():
                 and lowlat_gemm.supports(x, layer.weight)
                 and lowlat_gemm.prefer_lowlat(lowlat_gemm.kind_of(x, layer.weight), *layer.weight.shape, m, x.device)
             ):
+                nxt = _next_weight.get(layer.weight.data_ptr()) if PREFETCH else None
+                if nxt is not None:
+                    nbytes = min(PREFETCH_MAX, nxt.numel() * nxt.element_size())
+                    return lowlat_gemm.gemm(x, layer.weight, prefetch=nxt, prefetch_bytes=nbytes)
                 return lowlat_gemm.gemm(x, layer.weight)
             return super().apply(layer, x, bias)
 
@@ -89,6 +116,7 @@ def install(module) -> int:
         elems, counters = max(elems, e), max(counters, c)
     # CUDA graph capture runs before any eager small-batch call, so the split-K buffers are sized here.
     lowlat_gemm.reserve_workspace(device, elems, counters)
+    lowlat_gemm.set_pdl(os.environ.get("LLG_PDL", "1") == "1")
     return swapped
 
 

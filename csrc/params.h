@@ -18,6 +18,11 @@ struct Params {
   unsigned* counters;  // one arrival counter per block column, zero between launches
   bool out_fp32;
   bool f16;            // x, w (and a 16-bit y) are f16 instead of bf16
+  bool cluster;        // split-K partials reduced over distributed shared memory (ksplit <= 8)
+  const void* pf;      // optional: L2 prefetch of [pf, pf + pf_bytes) (the next GEMM's weight)
+  int64_t pf_bytes;
+  bool pdl;            // launch with programmatic dependent launch (set by the launcher)
+  bool pdl_early;      // the grid fits in one wave: let the next kernel launch right away
 };
 
 struct LaunchConfig {

@@ -65,21 +65,51 @@ class ColdWeights:
         return len(self.items)
 
 
-def time_per_call(fn, weights: ColdWeights, calls: int | None = None, replays: int = 20) -> float:
-    """Median microseconds per fn(w, w_kwargs) call, replaying a CUDA graph over the rotating weights."""
+def producer(x: torch.Tensor):
+    """A small kernel that rewrites x before each GEMM (as a norm or activation would in a decode step), so the
+    timing includes the dependency on a preceding non-GEMM kernel. Returns a callable, or None for back-to-back."""
+    xb = x.view(torch.uint8) if x.element_size() == 1 else x
+    src = xb.clone()
+    return lambda: xb.copy_(src)
+
+
+def time_per_call(fn, weights: ColdWeights, calls: int | None = None, replays: int = 20, before=None) -> float:
+    """Median microseconds per fn(w, w_kwargs, next_w) call, replaying a CUDA graph over the rotating weights
+    (next_w: the weight of the following call).
+
+    With `before`, every call is preceded by before() and the time of a graph of before() calls alone is
+    subtracted, so the result is the GEMM's share of a producer -> GEMM pair."""
     calls = calls or max(len(weights), 64)
+    t = _time_graph(fn, weights, calls, replays, before)
+    if before is None:
+        return t
+    return t - _time_graph(None, weights, calls, replays, before)
+
+
+def _time_graph(fn, weights: ColdWeights, calls: int, replays: int, before) -> float:
     seq = [weights.items[i % len(weights)] for i in range(calls)]
+    nxt = [weights.items[(i + 1) % len(weights)][0] for i in range(calls)]
+    pos = [0]
+
+    def step(w, kw):
+        if before is not None:
+            before()
+        if fn is not None:
+            fn(w, kw, nxt[pos[0] % calls])
+        pos[0] += 1
+
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
         for w, kw in seq[: min(len(seq), 8)]:
-            fn(w, kw)
+            step(w, kw)
     torch.cuda.current_stream().wait_stream(s)
     torch.cuda.synchronize()
+    pos[0] = 0
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         for w, kw in seq:
-            fn(w, kw)
+            step(w, kw)
     graph.replay()
     torch.cuda.synchronize()
     times = []
@@ -98,10 +128,10 @@ def time_per_call(fn, weights: ColdWeights, calls: int | None = None, replays: i
 def baseline(kind: str, x: torch.Tensor, x_kw: dict):
     """A vendor-library reference for the same product, or None (W8A16 / W4A16 / NVFP4 have none here)."""
     if kind in ("bf16", "f16"):
-        return lambda w, kw: torch.nn.functional.linear(x, w)
+        return lambda w, kw, nxt=None: torch.nn.functional.linear(x, w)
     if kind == "fp8" and hasattr(torch, "_scaled_mm"):
         one = torch.ones(1, device=x.device)
-        return lambda w, kw: torch._scaled_mm(x, w.t(), one, one, out_dtype=torch.bfloat16)
+        return lambda w, kw, nxt=None: torch._scaled_mm(x, w.t(), one, one, out_dtype=torch.bfloat16)
     if kind == "int8" and hasattr(torch, "_int_mm") and x.shape[0] > 16:
-        return lambda w, kw: torch._int_mm(x, w.t())
+        return lambda w, kw, nxt=None: torch._int_mm(x, w.t())
     return None

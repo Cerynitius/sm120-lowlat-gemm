@@ -17,6 +17,8 @@
 #include <stdint.h>
 
 #include "params.h"
+#include "pdl.cuh"
+#include "ptx.cuh"
 
 namespace llg {
 
@@ -101,6 +103,8 @@ __global__ void __launch_bounds__(256) gemv_kernel(const Params p) {
 #pragma unroll
     for (int m = 0; m < MT; ++m) acc[r][m] = 0.f;
 
+  if (p.pdl_early) pdl_trigger();
+  bool waited = false;
   for (int v0 = vbeg + sl; v0 < vend; v0 += LPR * U) {
     uint4 wv[U][R];
 #pragma unroll
@@ -110,6 +114,10 @@ __global__ void __launch_bounds__(256) gemv_kernel(const Params p) {
       for (int r = 0; r < R; ++r) {
         wv[u][r] = (v < vend && rvalid[r]) ? ld_weight(wrow[r] + (int64_t)v * 8) : make_uint4(0, 0, 0, 0);
       }
+    }
+    if (!waited) {  // the first weight vectors are in flight; x may still be written by the previous kernel
+      pdl_wait();
+      waited = true;
     }
 #pragma unroll
     for (int u = 0; u < U; ++u) {
@@ -133,6 +141,10 @@ __global__ void __launch_bounds__(256) gemv_kernel(const Params p) {
     }
   }
 
+  pdl_wait();
+  if (!p.pdl_early) pdl_trigger();
+  l2_prefetch_slice(p.pf, p.pf_bytes, blockIdx.x + (int64_t)gridDim.x * blockIdx.y, (int64_t)gridDim.x * gridDim.y);
+
   // Butterfly over the LPR lanes of this row group; every lane ends with the same sums.
 #pragma unroll
   for (int off = LPR / 2; off >= 1; off >>= 1)
@@ -147,6 +159,30 @@ __global__ void __launch_bounds__(256) gemv_kernel(const Params p) {
 #pragma unroll
       for (int m = 0; m < MT; ++m)
         if (sl == (r * MT + m) % LPR && m < p.M && rvalid[r]) store_out<F16>(p, m, row0 + r, acc[r][m]);
+    return;
+  }
+
+  if (p.cluster) {
+    // Split-K inside a cluster of the ksplit blocks of this column: partials stay in each block's shared memory and
+    // block r adds slice r of the column over the blocks in split order (same order as the workspace path).
+    extern __shared__ float red[];  // [rows_per_block][M]
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+      for (int m = 0; m < MT; ++m)
+        if (sl == (r * MT + m) % LPR && m < p.M) red[(row0 + r - block_row0) * p.M + m] = acc[r][m];
+    cluster_sync();
+    const int nrows = min(rows_per_block, p.N - block_row0);
+    const int total = nrows * p.M, per = (total + p.ksplit - 1) / p.ksplit;
+    const int e0 = (int)cluster_rank() * per, e1 = min(total, e0 + per);
+    const uint32_t base = smem_addr(red);
+    for (int i = e0 + threadIdx.x; i < e1; i += blockDim.x) {
+      const uint32_t addr = base + (uint32_t)i * 4u;
+      float s = __uint_as_float(ld_cluster_u32(cluster_map(addr, 0)));
+      for (int k = 1; k < p.ksplit; ++k) s += __uint_as_float(ld_cluster_u32(cluster_map(addr, (uint32_t)k)));
+      store_out<F16>(p, i % p.M, block_row0 + i / p.M, s);
+    }
+    cluster_sync();  // keep this block's partials alive until every block has read them
     return;
   }
 

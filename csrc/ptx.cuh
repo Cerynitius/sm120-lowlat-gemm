@@ -14,6 +14,30 @@ __device__ __forceinline__ uint32_t smem_addr(const void* p) {
 }
 
 // 16-byte global -> shared copy; src_bytes = 0 zero-fills the destination.
+// ---- thread block clusters (distributed shared memory) ----
+__device__ __forceinline__ void cluster_sync() {
+  asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;\n" ::: "memory");
+}
+
+__device__ __forceinline__ uint32_t cluster_rank() {
+  uint32_t r;
+  asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(r));
+  return r;
+}
+
+// Address of the same shared-memory location in block `rank` of this cluster.
+__device__ __forceinline__ uint32_t cluster_map(uint32_t addr, uint32_t rank) {
+  uint32_t r;
+  asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(r) : "r"(addr), "r"(rank));
+  return r;
+}
+
+__device__ __forceinline__ uint32_t ld_cluster_u32(uint32_t addr) {
+  uint32_t v;
+  asm volatile("ld.shared::cluster.u32 %0, [%1];" : "=r"(v) : "r"(addr) : "memory");
+  return v;
+}
+
 __device__ __forceinline__ void cp_async16(uint32_t dst, const void* src, uint32_t src_bytes) {
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(src), "r"(src_bytes));
 }

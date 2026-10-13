@@ -20,6 +20,7 @@
 
 #include <type_traits>
 
+#include "pdl.cuh"
 #include "ptx.cuh"
 #include "tc_params.h"
 
@@ -167,6 +168,12 @@ __device__ __forceinline__ void epilogue_store(const TcParams& prm, float alpha,
 // ---------------------------------------------------------------------------------------------------------------
 // The kernel
 
+template <typename Acc>
+__device__ __forceinline__ Acc acc_from_bits(uint32_t bits) {
+  if constexpr (std::is_same<Acc, float>::value) return __uint_as_float(bits);
+  else return static_cast<int32_t>(bits);
+}
+
 template <int KIND, int CFG>
 __global__ void __launch_bounds__(Cfg<CFG>::kThreads) tc_gemm_kernel(const TcParams prm) {
   using K = Kind<KIND>;
@@ -201,9 +208,9 @@ __global__ void __launch_bounds__(Cfg<CFG>::kThreads) tc_gemm_kernel(const TcPar
   const int stages = prm.stages;
 
   // ---- producer: one stage = A tile, B tile (+ scale tiles) for K tile kt ----
-  auto load_stage = [&](int slot, int kt) {
+  auto load_stage = [&](int slot, int kt, bool la, bool lb) {
     const uint32_t st = sbase + slot * L::kStageBytes;
-    {
+    if (la) {
       constexpr int CH = L::kARow / 16, N = BP * CH;
       for (int i = tid; i < N; i += C::kThreads) {
         const int r = i / CH, c = i % CH;
@@ -212,7 +219,7 @@ __global__ void __launch_bounds__(Cfg<CFG>::kThreads) tc_gemm_kernel(const TcPar
         cp_async16(tile_addr<L::kARow>(st + L::kAOff, r, c * 16), ok ? A + (int64_t)gr * prm.lda + kb : A, ok ? 16 : 0);
       }
     }
-    {
+    if (lb) {
       constexpr int CH = L::kBRow / 16, N = BQ * CH;
       for (int i = tid; i < N; i += C::kThreads) {
         const int r = i / CH, c = i % CH;
@@ -221,22 +228,26 @@ __global__ void __launch_bounds__(Cfg<CFG>::kThreads) tc_gemm_kernel(const TcPar
         cp_async16(tile_addr<L::kBRow>(st + L::kBOff, r, c * 16), ok ? B + (int64_t)gr * prm.ldb + kb : B, ok ? 16 : 0);
       }
     }
-    if constexpr (L::kASF > 0) {  // 4-byte pieces: K % 64 == 0 is enough
-      constexpr int CH = L::kASF / 4, N = BP * CH;
-      for (int i = tid; i < N; i += C::kThreads) {
-        const int r = i / CH, c = i % CH;
-        const int gr = p0 + r, kb = kt * L::kASF + c * 4;
-        const bool ok = gr < prm.P && kb < sf_kbytes;
-        cp_async4(st + L::kASFOff + r * L::kASF + c * 4, ok ? ASF + (int64_t)gr * prm.lda_sf + kb : ASF, ok ? 4 : 0);
+    if constexpr (L::kASF > 0) {
+      if (la) {  // 4-byte pieces: K % 64 == 0 is enough
+        constexpr int CH = L::kASF / 4, N = BP * CH;
+        for (int i = tid; i < N; i += C::kThreads) {
+          const int r = i / CH, c = i % CH;
+          const int gr = p0 + r, kb = kt * L::kASF + c * 4;
+          const bool ok = gr < prm.P && kb < sf_kbytes;
+          cp_async4(st + L::kASFOff + r * L::kASF + c * 4, ok ? ASF + (int64_t)gr * prm.lda_sf + kb : ASF, ok ? 4 : 0);
+        }
       }
     }
     if constexpr (L::kBSF > 0) {
-      constexpr int CH = L::kBSF / 4, N = BQ * CH;
-      for (int i = tid; i < N; i += C::kThreads) {
-        const int r = i / CH, c = i % CH;
-        const int gr = q0 + r, kb = kt * L::kBSF + c * 4;
-        const bool ok = gr < prm.Q && kb < sf_kbytes;
-        cp_async4(st + L::kBSFOff + r * L::kBSF + c * 4, ok ? BSF + (int64_t)gr * prm.ldb_sf + kb : BSF, ok ? 4 : 0);
+      if (lb) {
+        constexpr int CH = L::kBSF / 4, N = BQ * CH;
+        for (int i = tid; i < N; i += C::kThreads) {
+          const int r = i / CH, c = i % CH;
+          const int gr = q0 + r, kb = kt * L::kBSF + c * 4;
+          const bool ok = gr < prm.Q && kb < sf_kbytes;
+          cp_async4(st + L::kBSFOff + r * L::kBSF + c * 4, ok ? BSF + (int64_t)gr * prm.ldb_sf + kb : BSF, ok ? 4 : 0);
+        }
       }
     }
   };
@@ -372,20 +383,28 @@ __global__ void __launch_bounds__(Cfg<CFG>::kThreads) tc_gemm_kernel(const TcPar
 
   // ---- multistage main loop ----
   const int ntiles = kt_end - kt_beg;
+  // the weight (A when swapped, else B) never depends on the previous kernel: start streaming it before the PDL wait
+  const bool a_is_w = prm.swap;
+  for (int s = 0; s < stages - 1 && s < ntiles; ++s) load_stage(s, kt_beg + s, a_is_w, !a_is_w);
+  pdl_wait();
   for (int s = 0; s < stages - 1; ++s) {
-    if (s < ntiles) load_stage(s, kt_beg + s);
+    if (s < ntiles) load_stage(s, kt_beg + s, !a_is_w, a_is_w);
     cp_async_commit();
   }
+  if (prm.pdl_early) pdl_trigger();
   for (int it = 0; it < ntiles; ++it) {
     // groups committed so far: stages-1+it; the one for `it` has landed when <= stages-2 remain pending
     cp_async_wait_dyn(stages - 2);
     __syncthreads();
     const int pf = it + stages - 1;
-    if (pf < ntiles) load_stage(pf % stages, kt_beg + pf);
+    if (pf < ntiles) load_stage(pf % stages, kt_beg + pf, true, true);
     cp_async_commit();
     compute_stage(it % stages);
   }
   cp_async_wait<0>();
+  if (!prm.pdl_early) pdl_trigger();
+  l2_prefetch_slice(prm.pf, prm.pf_bytes, blockIdx.x + (int64_t)gridDim.x * (blockIdx.y + (int64_t)gridDim.y * blockIdx.z),
+                    (int64_t)gridDim.x * gridDim.y * gridDim.z);
 
   // ---- epilogue ----
   const float alpha = prm.alpha_ptr ? prm.alpha * *prm.alpha_ptr : prm.alpha;
@@ -400,6 +419,35 @@ __global__ void __launch_bounds__(Cfg<CFG>::kThreads) tc_gemm_kernel(const TcPar
           const int q = q0 + wq0 + j * 8 + 2 * t + (e & 1);
           if (p < prm.P && q < prm.Q) epilogue_store(prm, alpha, p, q, (float)acc[i][j][e]);
         }
+    return;
+  }
+
+  if (prm.cluster) {
+    // split-K inside a cluster of the ksplit blocks of this tile: each block parks its partial tile in its own shared
+    // memory, then block r sums rows [r*BP/ksplit, (r+1)*BP/ksplit) over the blocks in split order (same order as the
+    // workspace path below, so both give identical results)
+    __syncthreads();  // every warp is done with the pipeline buffers
+    Acc* const red = reinterpret_cast<Acc*>(smem);
+#pragma unroll
+    for (int i = 0; i < MP; ++i)
+#pragma unroll
+      for (int j = 0; j < NQ; ++j)
+#pragma unroll
+        for (int e = 0; e < 4; ++e)
+          red[(wp0 + i * 16 + g + (e >> 1) * 8) * BQ + wq0 + j * 8 + 2 * t + (e & 1)] = acc[i][j][e];
+    cluster_sync();
+    const int rank = (int)cluster_rank();
+    const int np = min(BP, prm.P - p0), nq = min(BQ, prm.Q - q0);
+    const int rows = (BP + ksplit - 1) / ksplit;
+    const int r0 = rank * rows, r1 = min(np, r0 + rows);
+    for (int idx = tid; idx < (r1 - r0) * nq; idx += C::kThreads) {
+      const int pl = r0 + idx / nq, ql = idx % nq;
+      const uint32_t addr = sbase + (uint32_t)(pl * BQ + ql) * 4u;
+      Acc s = acc_from_bits<Acc>(ld_cluster_u32(cluster_map(addr, 0)));
+      for (int k = 1; k < ksplit; ++k) s += acc_from_bits<Acc>(ld_cluster_u32(cluster_map(addr, (uint32_t)k)));
+      epilogue_store(prm, alpha, p0 + pl, q0 + ql, (float)s);
+    }
+    cluster_sync();  // keep this block's partials alive until every block has read them
     return;
   }
 
@@ -445,7 +493,13 @@ bool tc_launch_one(const TcParams& prm, cudaStream_t stream) {
   TcParams p = prm;
   const int cap = max_stages < kMaxStages ? max_stages : kMaxStages;
   p.stages = prm.stages < 2 ? 2 : (prm.stages > cap ? cap : prm.stages);
-  const int smem = p.stages * L::kStageBytes;
+  int smem = p.stages * L::kStageBytes;
+  if (p.ksplit == 1) p.cluster = false;
+  if (p.cluster) {
+    // partial tile in shared memory; portable cluster size
+    if (p.ksplit > 8 || (int64_t)C::BP * C::BQ * 4 > kMaxSmem) return false;
+    if (smem < C::BP * C::BQ * 4) smem = C::BP * C::BQ * 4;
+  }
   static unsigned attr_set = 0;  // per instantiation, one bit per device
   int dev = 0;
   if (cudaGetDevice(&dev) != cudaSuccess || dev >= 32) return false;
@@ -456,8 +510,10 @@ bool tc_launch_one(const TcParams& prm, cudaStream_t stream) {
     attr_set |= 1u << dev;
   }
   const dim3 grid((p.P + C::BP - 1) / C::BP, (p.Q + C::BQ - 1) / C::BQ, p.ksplit);
-  tc_gemm_kernel<KIND, CFG><<<grid, C::kThreads, smem, stream>>>(p);
-  return true;
+  p.pdl = pdl_enabled();
+  p.pdl_early = (int64_t)grid.x * grid.y * grid.z <= sm_count_current();
+  return launch_kernel(tc_gemm_kernel<KIND, CFG>, grid, dim3(C::kThreads), smem, stream, p.pdl,
+                       dim3(1, 1, p.cluster ? p.ksplit : 1), p) == cudaSuccess;
 }
 
 template <int KIND>

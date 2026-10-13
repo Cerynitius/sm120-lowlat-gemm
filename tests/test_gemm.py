@@ -186,8 +186,9 @@ def test_cuda_graph_replay():
 def test_quantize_fp8():
     x = torch.randn(5, 384, device=DEV).to(torch.bfloat16)
     q, s = L.quantize_fp8(x)
-    ref_s = x.float().abs().amax(dim=1) / 448
-    assert torch.allclose(s, ref_s)
+    # IEEE division (a CUDA tensor divided by a Python scalar is computed as a multiply by the reciprocal)
+    ref_s = x.float().abs().amax(dim=1) / torch.full((5,), 448.0, device=DEV)
+    assert torch.equal(s, ref_s)
     # the kernel multiplies by the reciprocal of the scale
     assert torch.equal(q, (x.float() * (1 / ref_s)[:, None]).clamp(-448, 448).to(FP8))
     st = torch.tensor([0.02], device=DEV)
@@ -198,8 +199,8 @@ def test_quantize_fp8():
 def test_quantize_int8():
     x = torch.randn(5, 384, device=DEV, dtype=torch.float32)
     q, s = L.quantize_int8(x)
-    ref_s = x.abs().amax(dim=1) / 127
-    assert torch.allclose(s, ref_s)
+    ref_s = x.abs().amax(dim=1) / torch.full((5,), 127.0, device=DEV)  # IEEE division, as in the kernel
+    assert torch.equal(s, ref_s)
     assert torch.equal(q, torch.round(x * (1 / ref_s)[:, None]).clamp(-127, 127).to(torch.int8))
 
 
@@ -258,3 +259,96 @@ def test_packaged_plans_match_reference():
             e = rel_err(y, xd @ wd.T)
             assert e < 2e-5, f"{key} m={m} {c}: rel err {e}"
             del x, w, xd, wd, y
+
+
+@pytest.mark.parametrize("m", [1, 4, 40])
+def test_pdl_chain_matches_serial(m):
+    """Each GEMM consumes the previous output and all split-K launches share one workspace: with PDL the next GEMM
+    starts early (weight prefetch), so any read of activations or workspace before the wait would show up here."""
+    g = gen(7)
+    dims = [2048, 1536, 4096, 512, 2048, 1024]
+    ws = [(torch.randn(dims[i + 1], dims[i], device=DEV, generator=g) / dims[i] ** 0.5).to(torch.bfloat16)
+          for i in range(len(dims) - 1)]
+    skinny = Plan(skinny=SkinnyOrder(lanes_per_row=16, ksplit=4, default_tile=SkinnyTile(1, 4, 4)), skinny_max_m=16)
+    plans = [Plan(tc={m: TcChoice(cfg=0, swap=True, stages=4, ksplit=8, cluster=True)}),
+             skinny,
+             Plan(tc={m: TcChoice(cfg=1, swap=True, stages=3, ksplit=4)}),
+             Plan(tc={m: TcChoice(cfg=4, swap=False, stages=2, ksplit=2)}),
+             Plan(tc={m: TcChoice(cfg=0, swap=False, stages=6, ksplit=1)})]
+    x = torch.randn(m, dims[0], device=DEV, generator=g).to(torch.bfloat16)
+    outs = [torch.empty(m, d, device=DEV, dtype=torch.bfloat16) for d in dims[1:]]
+
+    def chain(prefetch=False):
+        h = x
+        for i, (w, p, o) in enumerate(zip(ws, plans, outs)):
+            nxt = ws[(i + 1) % len(ws)] if prefetch else None
+            L.gemm(h, w, out=o, plan=p, prefetch=nxt, prefetch_bytes=(1 << 20) if i % 2 else 0)
+            h = o
+
+    L.reserve_workspace(torch.device(DEV), 8 * 4096 * 64, 4096)
+    L.set_pdl(False)
+    chain()
+    ref = [o.clone() for o in outs]
+    try:
+        L.set_pdl(True)
+        chain()  # eager with PDL
+        assert all(torch.equal(o, r) for o, r in zip(outs, ref))
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            chain()
+        torch.cuda.current_stream().wait_stream(s)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for r in range(4):
+                chain(prefetch=r % 2 == 1)
+        for _ in range(20):
+            for o in outs:
+                o.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            for i, (o, r) in enumerate(zip(outs, ref)):
+                assert torch.equal(o, r), f"stage {i} differs under PDL"
+    finally:
+        L.set_pdl(False)
+    _, cnt = L._ws[torch.cuda.current_device()]
+    assert int(cnt.abs().sum()) == 0
+
+
+@pytest.mark.parametrize("kind", list(L.KINDS))
+def test_cluster_split_k_matches_workspace_bitwise(kind):
+    n, k = 200, 4 * 256 + KIND_K[kind]
+    for m in (3, 70):
+        x, w, kw, xd, wd = operands(kind, m, n, k, seed=m + 1)
+        ref = xd @ wd.T
+        for cfg, swap, ksplit in itertools.product(range(L.NUM_CFGS), (False, True), (2, 5, 8)):
+            st = L.max_stages(kind, cfg)
+            bp, bq, _, _ = L.tc_info(kind, cfg)
+            if st < 2 or bp * bq * 4 > 99 * 1024 - 128:
+                continue
+            c = TcChoice(cfg=cfg, swap=swap, stages=min(3, st), ksplit=ksplit)
+            y_ws = L.gemm(x, w, out_dtype=torch.float32, plan=Plan(tc={m: c}), **kw)
+            cc = TcChoice(cfg=cfg, swap=swap, stages=min(3, st), ksplit=ksplit, cluster=True)
+            y_cl = L.gemm(x, w, out_dtype=torch.float32, plan=Plan(tc={m: cc}), **kw)
+            assert torch.equal(y_cl, y_ws), f"{kind} m={m} {cc}"
+            assert rel_err(y_cl, ref) < 2e-5
+
+
+@pytest.mark.parametrize("dt", [torch.bfloat16, torch.float16])
+def test_skinny_cluster_matches_workspace_bitwise(dt):
+    kind = "bf16" if dt == torch.bfloat16 else "f16"
+    for n, k in [(336, 10240), (513, 2560), (33, 136)]:
+        x, w, _, xd, wd = operands(kind, 16, n, k, seed=2)
+        ref = xd @ wd.T
+        for lanes, ks in itertools.product((8, 16, 32), (2, 4, 8)):
+            if (k // 8) // ks < lanes:
+                continue
+            for (r, u), wp in [((1, 4), 4), ((2, 2), 8), ((4, 2), 2), ((1, 8), 1)]:
+                tile = SkinnyTile(r, u, wp)
+                o_ws = SkinnyOrder(lanes_per_row=lanes, ksplit=ks, default_tile=tile)
+                o_cl = SkinnyOrder(lanes_per_row=lanes, ksplit=ks, default_tile=tile, cluster=True)
+                for m in (1, 3, 8, 16):
+                    y_ws = L.gemm(x[:m], w, out_dtype=torch.float32, plan=Plan(skinny=o_ws, skinny_max_m=16))
+                    y_cl = L.gemm(x[:m], w, out_dtype=torch.float32, plan=Plan(skinny=o_cl, skinny_max_m=16))
+                    assert torch.equal(y_cl, y_ws), (n, k, lanes, ks, r, u, wp, m)
+                    assert rel_err(y_cl, ref[:m]) < 2e-5

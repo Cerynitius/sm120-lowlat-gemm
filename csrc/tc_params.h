@@ -52,6 +52,11 @@ struct TcParams {
   int stages;
   void* ws;           // split-K partials [ksplit, P, Q] (fp32 or int32)
   unsigned* counters; // per output tile, zero between launches
+  bool cluster;       // split-K partials reduced over distributed shared memory (ksplit blocks per cluster)
+  const void* pf;     // optional: L2 prefetch of [pf, pf + pf_bytes) (the next GEMM's weight)
+  int64_t pf_bytes;
+  bool pdl;           // launch with programmatic dependent launch (set by the launcher)
+  bool pdl_early;     // the grid fits in one wave: let the next kernel launch right away
 };
 
 // Defined per kind in tc_<kind>.cu; false if the configuration cannot run (shared memory).
@@ -60,6 +65,9 @@ bool tc_launch_kind(const TcParams& p, int cfg, cudaStream_t stream);
 
 // Bytes of shared memory one pipeline stage needs (0 for an invalid kind/config).
 int tc_stage_bytes(int kind, int cfg);
+// Programmatic dependent launch for every later GEMM launch (process-wide; see pdl.cuh).
+void set_pdl_flag(bool on);
+bool pdl_enabled();
 // Tile shape of a config.
 void tc_cfg_tile(int cfg, int* bp, int* bq, int* threads);
 

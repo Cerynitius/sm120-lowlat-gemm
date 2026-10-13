@@ -50,6 +50,7 @@ __all__ = [
     "quantize_nvfp4",
     "reserve_workspace",
     "save_plans",
+    "set_pdl",
     "set_plan",
     "supports",
     "workspace_need",
@@ -102,12 +103,15 @@ class SkinnyOrder:
     ksplit: int = 1
     tiles: dict[int, SkinnyTile] = field(default_factory=dict)
     default_tile: SkinnyTile = field(default_factory=SkinnyTile)
+    cluster: bool = False  # split-K reduced in a thread block cluster (ksplit <= 8); same summation order
 
     def __post_init__(self):
         if self.lanes_per_row not in (8, 16, 32):
             raise ValueError(f"lanes_per_row must be 8, 16 or 32, got {self.lanes_per_row}")
         if not 1 <= self.ksplit <= 64:
             raise ValueError(f"ksplit must be in [1, 64], got {self.ksplit}")
+        if self.cluster and self.ksplit > 8:
+            raise ValueError(f"cluster split-K needs ksplit <= 8, got {self.ksplit}")
 
     def tile(self, m: int) -> SkinnyTile:
         return _nearest(self.tiles, m, self.default_tile)
@@ -119,12 +123,15 @@ class TcChoice:
     swap: bool       # weight is the MMA A operand (few tokens)
     stages: int = 4
     ksplit: int = 1
+    cluster: bool = False  # split-K reduced in a thread block cluster (ksplit <= 8, no workspace)
 
     def __post_init__(self):
         if not 0 <= self.cfg < NUM_CFGS:
             raise ValueError(f"cfg must be in [0, {NUM_CFGS}), got {self.cfg}")
         if not 1 <= self.ksplit <= 64 or not 2 <= self.stages <= 8:
             raise ValueError(f"bad ksplit/stages {self.ksplit}/{self.stages}")
+        if self.cluster and self.ksplit > 8:
+            raise ValueError(f"cluster split-K needs ksplit <= 8, got {self.ksplit}")
 
 
 @dataclass
@@ -144,6 +151,7 @@ class Plan:
             d["skinny"] = {
                 "lanes_per_row": self.skinny.lanes_per_row,
                 "ksplit": self.skinny.ksplit,
+                "cluster": self.skinny.cluster,
                 "default_tile": asdict(self.skinny.default_tile),
                 "tiles": {str(m): asdict(t) for m, t in sorted(self.skinny.tiles.items())},
             }
@@ -157,6 +165,7 @@ class Plan:
             skinny = SkinnyOrder(
                 lanes_per_row=int(sk["lanes_per_row"]),
                 ksplit=int(sk["ksplit"]),
+                cluster=bool(sk.get("cluster", False)),
                 default_tile=SkinnyTile(**sk.get("default_tile", {})),
                 tiles={int(m): SkinnyTile(**t) for m, t in sk.get("tiles", {}).items()},
             )
@@ -334,6 +343,20 @@ def get_plan(kind: str, n: int, k: int, device: torch.device | None = None) -> P
 _ws: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
+def set_pdl(on: bool = True) -> None:
+    """Programmatic dependent launch for all later gemm() calls (process-wide).
+
+    A GEMM may then start while the previous kernel is still running and stream its weight early; activations,
+    outputs and split-K buffers are touched only after the previous kernel has finished. Enable it only when no kernel
+    still in flight writes the weights (true for inference with fixed weights). Graphs keep the setting they were
+    captured with."""
+    torch.ops.lowlat_gemm.set_pdl(bool(on))
+
+
+def pdl_enabled() -> bool:
+    return bool(torch.ops.lowlat_gemm.pdl_enabled())
+
+
 def reserve_workspace(device: torch.device, elems: int, counters: int) -> None:
     """Grow the split-K buffers of `device` to at least `elems` 4-byte partials and `counters` counters.
     Call before CUDA graph capture; growing during capture raises."""
@@ -435,12 +458,12 @@ def workspace_need(kind: str, n: int, k: int, max_m: int, device: torch.device |
         if plan.skinny is not None and m <= min(plan.skinny_max_m, SKINNY_MAX_TOKENS):
             o = plan.skinny
             t = o.tile(m)
-            if o.ksplit > 1:
+            if o.ksplit > 1 and not o.cluster:
                 elems = max(elems, o.ksplit * m * n)
                 counters = max(counters, -(-n // (t.warps * (32 // o.lanes_per_row) * t.rows)))
             continue
         c = _tc_lookup(plan.tc, m) or default_tc_choice(kind, m, n, k, _sm_count(device))
-        if c.ksplit > 1:
+        if c.ksplit > 1 and not c.cluster:
             bp, bq, _, _ = tc_info(kind, c.cfg)
             p, q = (n, m) if (c.swap or kind in _MIXED) else (m, n)
             elems = max(elems, c.ksplit * p * q)
@@ -465,11 +488,15 @@ def gemm(
     out_dtype: torch.dtype | None = None,
     out: torch.Tensor | None = None,
     plan: Plan | None = None,
+    prefetch: torch.Tensor | None = None,
+    prefetch_bytes: int = 0,
 ) -> torch.Tensor:
     """y = alpha * (x * x_scale) @ (w * w_scale)^T + bias. See the module docstring for the precisions.
 
     x_scale / w_scale: None, a float, or a float32 tensor with 1 element or one per row (M for x, N for w).
     alpha: None, a float or a 1-element float32 tensor (device scalars stay valid inside CUDA graphs).
+    prefetch: a contiguous tensor (typically the weight of the GEMM that runs next) whose first prefetch_bytes
+    (0 = all) the kernel pulls into L2 once its own weight is streaming.
     """
     kind = kind_of(x, w, x_block_scale, w_block_scale)
     fp4 = kind in ("nvfp4", "w4a16_bf16", "w4a16_f16")
@@ -496,12 +523,13 @@ def gemm(
     ):
         order = plan.skinny
         t = order.tile(m)
-        if order.ksplit > 1:
+        if order.ksplit > 1 and not order.cluster:
             per_block = t.warps * (32 // order.lanes_per_row) * t.rows
             ws, cnt = _workspace(device, order.ksplit * m * n, -(-n // per_block))
         else:
             ws, cnt = _workspace(device, 0, 0)
-        torch.ops.lowlat_gemm.skinny_out(y2, x2, w, ws, cnt, t.rows, t.unroll, order.lanes_per_row, t.warps, order.ksplit)
+        torch.ops.lowlat_gemm.skinny_out(y2, x2, w, ws, cnt, t.rows, t.unroll, order.lanes_per_row, t.warps, order.ksplit,
+                                         order.cluster, prefetch, prefetch_bytes)
         return out if out is not None else y2.view(*lead, n)
 
     c = _tc_lookup(plan.tc, m) or default_tc_choice(kind, m, n, k, _sm_count(device))
@@ -530,10 +558,11 @@ def gemm(
         a_sf, b_sf = wsf, None
     bp, bq, _, _ = tc_info(kind, c.cfg)
     tiles = -(-p // bp) * -(-q // bq)
-    wsp, cnt = _workspace(device, c.ksplit * p * q if c.ksplit > 1 else 0, tiles if c.ksplit > 1 else 0)
+    use_ws = c.ksplit > 1 and not c.cluster
+    wsp, cnt = _workspace(device, c.ksplit * p * q if use_ws else 0, tiles if use_ws else 0)
     torch.ops.lowlat_gemm.tc_gemm(
         y2, a, b, a_sf, b_sf, row_s, col_s, bias, alpha_t, alpha_f, KINDS[kind][0], swap, swap,
-        c.cfg, c.stages, c.ksplit, wsp, cnt,
+        c.cfg, c.stages, c.ksplit, wsp, cnt, c.cluster, prefetch, prefetch_bytes,
     )
     return out if out is not None else y2.view(*lead, n)
 

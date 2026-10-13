@@ -29,7 +29,7 @@ SKINNY_TILES = [SkinnyTile(r, u, w) for (r, u), w in itertools.product([(1, 2), 
 KSPLITS = (1, 2, 4, 8, 16)
 
 
-def tc_candidates(kind: str, m: int, n: int, k: int):
+def tc_candidates(kind: str, m: int, n: int, k: int, sm_count: int):
     nk = -(-k // L.KINDS[kind][1])
     for cfg in range(L.NUM_CFGS):
         top = L.max_stages(kind, cfg)
@@ -40,9 +40,12 @@ def tc_candidates(kind: str, m: int, n: int, k: int):
             p, q = (n, m) if swap else (m, n)
             if (bq > 2 * q and bq > 8) or (bp > 4 * p and bp > 64):  # tile far larger than the problem: skip
                 continue
-            for stages in sorted({2, min(3, top), min(4, top), top}):
+            tiles = -(-p // bp) * -(-q // bq)
+            if bp * bq <= 256 and tiles > 4 * sm_count:  # small tiles only pay off when they are needed to fill the GPU
+                continue
+            for stages in sorted({2, min(3, top), min(4, top), min(8, top), top}):
                 for ks in KSPLITS:
-                    if ks > 1 and nk // ks < 2:
+                    if ks > 1 and (nk // ks < 2 or tiles * ks > 4 * sm_count):
                         continue
                     yield TcChoice(cfg=cfg, swap=swap, stages=stages, ksplit=ks)
                     if 1 < ks <= 8 and bp * bq * 4 <= 99 * 1024 - 128:
@@ -64,6 +67,7 @@ def main() -> None:
     args = ap.parse_args()
 
     dev = torch.device("cuda", torch.cuda.current_device())
+    sm_count = torch.cuda.get_device_properties(dev).multi_processor_count
     L.set_pdl(args.pdl)
     tokens = [int(t) for t in args.tokens.split(",")]
     shapes = json.load(open(args.shapes))["shapes"]
@@ -83,7 +87,7 @@ def main() -> None:
                 x, x_kw = make_input(kind, m, k, dev)
                 out = torch.empty(m, n, device=dev, dtype=torch.float16 if kind == "f16" or kind.endswith("_f16") else torch.bfloat16)
                 best = None
-                for c in tc_candidates(kind, m, n, k):
+                for c in tc_candidates(kind, m, n, k, sm_count):
                     t = time_per_call(lambda w, kw, nxt: L.gemm(x, w, out=out, plan=Plan(tc={m: c}), **kw, **x_kw), cold,
                                       calls=calls, replays=args.replays,
                                       before=producer(x) if args.between == "write" else None)

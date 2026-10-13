@@ -73,7 +73,7 @@ KINDS = {
     "w4a16_f16": (8, 128, 64),
 }
 _MIXED = {"w8a16_bf16", "w8a16_f16", "w4a16_bf16", "w4a16_f16"}
-NUM_CFGS = 8
+NUM_CFGS = 10
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -128,7 +128,7 @@ class TcChoice:
     def __post_init__(self):
         if not 0 <= self.cfg < NUM_CFGS:
             raise ValueError(f"cfg must be in [0, {NUM_CFGS}), got {self.cfg}")
-        if not 1 <= self.ksplit <= 64 or not 2 <= self.stages <= 8:
+        if not 1 <= self.ksplit <= 64 or not 2 <= self.stages <= 16:
             raise ValueError(f"bad ksplit/stages {self.ksplit}/{self.stages}")
         if self.cluster and self.ksplit > 8:
             raise ValueError(f"cluster split-K needs ksplit <= 8, got {self.ksplit}")
@@ -205,7 +205,7 @@ def tc_info(kind: str, cfg: int) -> tuple[int, int, int, int]:
 
 
 def max_stages(kind: str, cfg: int) -> int:
-    return min(8, (99 * 1024 - 128) // tc_info(kind, cfg)[3])
+    return min(16, (99 * 1024 - 128) // tc_info(kind, cfg)[3])
 
 
 def default_skinny_order(n: int, k: int, sm_count: int) -> SkinnyOrder:
@@ -219,8 +219,9 @@ def default_skinny_order(n: int, k: int, sm_count: int) -> SkinnyOrder:
     return SkinnyOrder(lanes_per_row=lanes, ksplit=ksplit, default_tile=SkinnyTile(rows=rows, unroll=4, warps=4))
 
 
-# next smaller tile per config (BPxBQ): 256x128 -> 128x128 -> 64x64 -> 64x8; 128x64 -> 128x32 -> 128x16 -> 64x8
-_SMALLER = {7: 6, 6: 4, 5: 4, 4: 0, 3: 2, 2: 1, 1: 0, 0: None}
+# next smaller tile per config (BPxBQ): 256x128 -> 128x128 -> 64x64 -> 64x8 -> 32x8 -> 16x8;
+# 128x64 -> 128x32 -> 128x16 -> 64x8
+_SMALLER = {7: 6, 6: 4, 5: 4, 4: 0, 3: 2, 2: 1, 1: 0, 0: 9, 9: 8, 8: None}
 
 
 def default_tc_choice(kind: str, m: int, n: int, k: int, sm_count: int) -> TcChoice:
@@ -284,11 +285,17 @@ def _file_key(name: str) -> str:
 
 
 def load_plans(path: str | os.PathLike, device_name: str | None = None) -> int:
-    """Load a plan file {"device": ..., "plans": {"<kind>:<N>x<K>": plan}}. Returns the number of plans."""
+    """Load a plan file {"device": ..., "plans": {"<kind>:<N>x<K>": plan}}. Returns the number of plans.
+    Its plans take precedence over the packaged ones."""
     data = json.loads(Path(path).read_text())
     name = device_name or data.get("device")
     if not name:
         raise ValueError(f"{path}: no device name in the file and none given")
+    _ensure_loaded(name)
+    return _load_data(data, name)
+
+
+def _load_data(data: dict, name: str) -> int:
     with _lock:
         for key, d in data.get("plans", {}).items():
             kind, nk = key.split(":")
@@ -302,6 +309,10 @@ def save_plans(path: str | os.PathLike, plans: dict[tuple[str, int, int], Plan],
     Path(path).write_text(json.dumps(data, indent=1))
 
 
+def _packaged_path(name: str) -> Path:
+    return Path(__file__).with_name("plans") / f"{_file_key(name)}.json"
+
+
 def _ensure_loaded(name: str) -> None:
     if name in _loaded:
         return
@@ -309,12 +320,13 @@ def _ensure_loaded(name: str) -> None:
         if name in _loaded:
             return
         _loaded.add(name)
-    packaged = Path(__file__).with_name("plans") / f"{_file_key(name)}.json"
+    packaged = _packaged_path(name)
     if packaged.is_file():
-        load_plans(packaged, name)
+        _load_data(json.loads(packaged.read_text()), name)
     env = os.environ.get("LLG_PLAN_FILE")
     if env:
-        load_plans(env)
+        data = json.loads(Path(env).read_text())
+        _load_data(data, data.get("device") or name)
 
 
 def set_plan(kind: str, n: int, k: int, plan: Plan, device: torch.device | None = None) -> None:

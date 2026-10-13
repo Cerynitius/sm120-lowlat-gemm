@@ -63,7 +63,15 @@ __device__ __forceinline__ void cp_async_wait_dyn(int pending) {
     case 3: cp_async_wait<3>(); break;
     case 4: cp_async_wait<4>(); break;
     case 5: cp_async_wait<5>(); break;
-    default: cp_async_wait<6>(); break;
+    case 6: cp_async_wait<6>(); break;
+    case 7: cp_async_wait<7>(); break;
+    case 8: cp_async_wait<8>(); break;
+    case 9: cp_async_wait<9>(); break;
+    case 10: cp_async_wait<10>(); break;
+    case 11: cp_async_wait<11>(); break;
+    case 12: cp_async_wait<12>(); break;
+    case 13: cp_async_wait<13>(); break;
+    default: cp_async_wait<14>(); break;
   }
 }
 

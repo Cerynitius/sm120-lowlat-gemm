@@ -117,6 +117,20 @@ def test_every_config_orientation_and_split(kind):
             assert e < 2e-5, f"{kind} m={m} {c}: rel err {e}"
 
 
+@pytest.mark.parametrize("kind", list(L.KINDS))
+def test_deep_pipelines(kind):
+    m, n, k = 5, 72, 24 * 256
+    x, w, kw, xd, wd = operands(kind, m, n, k, seed=3)
+    ref = xd @ wd.T
+    for cfg, ksplit in itertools.product(range(L.NUM_CFGS), (1, 2)):
+        top = L.max_stages(kind, cfg)
+        for stages in sorted({s for s in (8, 12, top) if 2 <= s <= top}):
+            c = TcChoice(cfg=cfg, swap=True, stages=stages, ksplit=ksplit)
+            y = L.gemm(x, w, out_dtype=torch.float32, plan=Plan(tc={m: c}), **kw)
+            e = rel_err(y, ref)
+            assert e < 2e-5, f"{kind} {c}: rel err {e}"
+
+
 @pytest.mark.parametrize("kind", ["bf16", "fp8", "nvfp4", "w4a16_bf16"])
 def test_epilogue_bias_alpha_and_16bit_out(kind):
     m, n, k = 7, 130, 512
@@ -238,6 +252,26 @@ def test_plan_lookup_range_and_vendor_preference():
     assert L.prefer_lowlat("bf16", n, k, 64)  # beyond the tuned range: no measurement, keep lowlat_gemm
     restored = Plan.from_json(L.get_plan("bf16", n, k).to_json())
     assert restored.prefer_vendor == [16]
+
+
+def test_loaded_plans_override_packaged(tmp_path):
+    # fresh process: load_plans() before the first lookup must still win over the lazily loaded packaged plans
+    import json
+    import subprocess
+    import sys
+    name = torch.cuda.get_device_name()
+    key = next((k for k in json.loads(L._packaged_path(name).read_text())["plans"]), None) \
+        if L._packaged_path(name).is_file() else None
+    if key is None:
+        pytest.skip("no packaged plans for this GPU")
+    kind, nk = key.split(":")
+    n, k = (int(v) for v in nk.split("x"))
+    f = tmp_path / "p.json"
+    L.save_plans(f, {(kind, n, k): Plan(tc={1: TcChoice(cfg=0, swap=True, stages=3, ksplit=5)})}, name)
+    code = (f"import lowlat_gemm as L; L.load_plans({str(f)!r}); "
+            f"print(L.get_plan({kind!r}, {n}, {k}).tc[1].ksplit)")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout
+    assert out.strip() == "5"
 
 
 def test_packaged_plans_match_reference():

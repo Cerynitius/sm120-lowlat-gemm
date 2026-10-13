@@ -1,0 +1,15 @@
+{
+  "model": "Qwen/Qwen3.8-Flash-Next, TP=1: BF16 projections of one decode step in execution order",
+  "shapes": "qwen3.8-flash-next-tp1.json",
+  "blocks": {
+    "hc": ["act", "hc.mix_down_inject", "act", "hc.mix_up"],
+    "gdn": ["act", "gdn.in_proj_qkvz", "gdn.in_proj_ba", "act", "gdn.out_proj / qsa.o_proj"],
+    "attn": ["act", "qsa.qkv_gate", "qsa.indexer.index_qk_proj", "act", "gdn.out_proj / qsa.o_proj"],
+    "moe": ["act", "moe.router", "moe.shared_expert.gate_up", "act", "moe.shared_expert.down", "experts"]
+  },
+  "layer": ["hc", "mixer", "hc", "moe"],
+  "mixers": ["gdn", "gdn", "gdn", "attn"],
+  "layers": 48,
+  "tail": ["act", "hc.final_mix_down", "act", "lm_head"],
+  "experts_bytes": 27700000
+}

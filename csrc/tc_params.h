@@ -22,8 +22,8 @@ enum TcKind : int {
 
 enum DType : int { DT_NONE = 0, DT_BF16 = 1, DT_F16 = 2, DT_F32 = 3 };
 
-constexpr int kNumCfgs = 8;
-constexpr int kMaxStages = 8;
+constexpr int kNumCfgs = 10;
+constexpr int kMaxStages = 16;
 
 struct TcParams {
   // C[p, q] = sum_k A[p, k] B[q, k]; strides in bytes

@@ -97,6 +97,8 @@ LLG_CFG(4, 64, 64, 32, 32)     // 4 warps
 LLG_CFG(5, 128, 128, 64, 64)   // 4 warps
 LLG_CFG(6, 128, 128, 64, 32)   // 8 warps
 LLG_CFG(7, 256, 128, 64, 64)   // 8 warps
+LLG_CFG(8, 16, 8, 16, 8)       // 1 warp    small N: many blocks without a deep K split
+LLG_CFG(9, 32, 8, 16, 8)       // 2 warps
 #undef LLG_CFG
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -443,8 +445,14 @@ __global__ void __launch_bounds__(Cfg<CFG>::kThreads) tc_gemm_kernel(const TcPar
     for (int idx = tid; idx < (r1 - r0) * nq; idx += C::kThreads) {
       const int pl = r0 + idx / nq, ql = idx % nq;
       const uint32_t addr = sbase + (uint32_t)(pl * BQ + ql) * 4u;
-      Acc s = acc_from_bits<Acc>(ld_cluster_u32(cluster_map(addr, 0)));
-      for (int k = 1; k < ksplit; ++k) s += acc_from_bits<Acc>(ld_cluster_u32(cluster_map(addr, (uint32_t)k)));
+      uint32_t v[8];  // ksplit <= 8: issue every remote load, then add in split order
+#pragma unroll
+      for (int k = 0; k < 8; ++k)
+        if (k < ksplit) v[k] = ld_cluster_u32(cluster_map(addr, (uint32_t)k));
+      Acc s = acc_from_bits<Acc>(v[0]);
+#pragma unroll
+      for (int k = 1; k < 8; ++k)
+        if (k < ksplit) s += acc_from_bits<Acc>(v[k]);
       epilogue_store(prm, alpha, p0 + pl, q0 + ql, (float)s);
     }
     cluster_sync();  // keep this block's partials alive until every block has read them
@@ -472,10 +480,21 @@ __global__ void __launch_bounds__(Cfg<CFG>::kThreads) tc_gemm_kernel(const TcPar
   if (!is_last) return;
   __threadfence();
   const int np = min(BP, prm.P - p0), nq = min(BQ, prm.Q - q0);
+  const int64_t plane = (int64_t)prm.P * prm.Q;
   for (int idx = tid; idx < np * nq; idx += C::kThreads) {
     const int p = p0 + idx / nq, q = q0 + idx % nq;
-    Acc s = __ldcg(&ws[(int64_t)p * prm.Q + q]);
-    for (int k = 1; k < ksplit; ++k) s += __ldcg(&ws[((int64_t)k * prm.P + p) * prm.Q + q]);
+    const Acc* src = ws + (int64_t)p * prm.Q + q;
+    Acc s = 0;
+    // 8 partials in flight at a time (one L2 round trip per 8 instead of per partial), added in split order
+    for (int k0 = 0; k0 < ksplit; k0 += 8) {
+      Acc v[8];
+#pragma unroll
+      for (int j = 0; j < 8; ++j)
+        if (k0 + j < ksplit) v[j] = __ldcg(src + (k0 + j) * plane);
+#pragma unroll
+      for (int j = 0; j < 8; ++j)
+        if (k0 + j < ksplit) s = (k0 + j == 0) ? v[j] : s + v[j];
+    }
     epilogue_store(prm, alpha, p, q, (float)s);
   }
   if (tid == 0) prm.counters[tile] = 0u;
@@ -527,6 +546,8 @@ bool tc_launch_kind_impl(const TcParams& prm, int cfg, cudaStream_t stream) {
     case 5: return tc_launch_one<KIND, 5>(prm, stream);
     case 6: return tc_launch_one<KIND, 6>(prm, stream);
     case 7: return tc_launch_one<KIND, 7>(prm, stream);
+    case 8: return tc_launch_one<KIND, 8>(prm, stream);
+    case 9: return tc_launch_one<KIND, 9>(prm, stream);
     default: return false;
   }
 }

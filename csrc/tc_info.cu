@@ -16,6 +16,8 @@ static int stage_bytes_kind(int cfg) {
     case 5: return Layout<KIND, 5>::kStageBytes;
     case 6: return Layout<KIND, 6>::kStageBytes;
     case 7: return Layout<KIND, 7>::kStageBytes;
+    case 8: return Layout<KIND, 8>::kStageBytes;
+    case 9: return Layout<KIND, 9>::kStageBytes;
     default: return 0;
   }
 }
@@ -52,6 +54,8 @@ void tc_cfg_tile(int cfg, int* bp, int* bq, int* threads) {
     case 5: tile_of<5>(bp, bq, threads); break;
     case 6: tile_of<6>(bp, bq, threads); break;
     case 7: tile_of<7>(bp, bq, threads); break;
+    case 8: tile_of<8>(bp, bq, threads); break;
+    case 9: tile_of<9>(bp, bq, threads); break;
     default: *bp = *bq = *threads = 0;
   }
 }

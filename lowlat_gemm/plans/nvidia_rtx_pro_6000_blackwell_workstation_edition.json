@@ -7,37 +7,43 @@
     "1": {
      "cfg": 0,
      "swap": true,
-     "stages": 3,
-     "ksplit": 2
+     "stages": 4,
+     "ksplit": 2,
+     "cluster": true
     },
     "2": {
      "cfg": 0,
      "swap": true,
-     "stages": 3,
-     "ksplit": 2
+     "stages": 4,
+     "ksplit": 2,
+     "cluster": true
     },
     "4": {
      "cfg": 0,
      "swap": true,
-     "stages": 3,
-     "ksplit": 2
+     "stages": 4,
+     "ksplit": 2,
+     "cluster": true
     },
     "8": {
-     "cfg": 0,
+     "cfg": 1,
      "swap": true,
-     "stages": 4,
-     "ksplit": 1
+     "stages": 2,
+     "ksplit": 4,
+     "cluster": true
     },
     "16": {
      "cfg": 1,
      "swap": true,
-     "stages": 5,
-     "ksplit": 1
+     "stages": 2,
+     "ksplit": 4,
+     "cluster": true
     }
    },
    "skinny": {
     "lanes_per_row": 16,
     "ksplit": 1,
+    "cluster": false,
     "default_tile": {
      "rows": 1,
      "unroll": 4,
@@ -45,7 +51,7 @@
     },
     "tiles": {
      "1": {
-      "rows": 2,
+      "rows": 4,
       "unroll": 2,
       "warps": 2
      },
@@ -55,14 +61,14 @@
       "warps": 4
      },
      "4": {
-      "rows": 1,
-      "unroll": 2,
-      "warps": 4
-     },
-     "8": {
-      "rows": 1,
+      "rows": 2,
       "unroll": 2,
       "warps": 2
+     },
+     "8": {
+      "rows": 2,
+      "unroll": 2,
+      "warps": 4
      },
      "16": {
       "rows": 2,
@@ -70,49 +76,51 @@
       "warps": 2
      }
     }
-   },
-   "prefer_vendor": [
-    8,
-    16
-   ]
+   }
   },
   "bf16:96x2560": {
    "skinny_max_m": 4,
    "tc": {
     "1": {
-     "cfg": 0,
+     "cfg": 8,
      "swap": false,
      "stages": 4,
-     "ksplit": 16
+     "ksplit": 16,
+     "cluster": false
     },
     "2": {
-     "cfg": 0,
-     "swap": true,
+     "cfg": 8,
+     "swap": false,
      "stages": 4,
-     "ksplit": 16
+     "ksplit": 16,
+     "cluster": false
     },
     "4": {
-     "cfg": 0,
+     "cfg": 8,
      "swap": false,
-     "stages": 8,
-     "ksplit": 8
+     "stages": 4,
+     "ksplit": 16,
+     "cluster": false
     },
     "8": {
-     "cfg": 0,
+     "cfg": 9,
      "swap": false,
-     "stages": 8,
-     "ksplit": 8
+     "stages": 4,
+     "ksplit": 16,
+     "cluster": false
     },
     "16": {
      "cfg": 0,
      "swap": false,
-     "stages": 8,
-     "ksplit": 8
+     "stages": 4,
+     "ksplit": 8,
+     "cluster": true
     }
    },
    "skinny": {
     "lanes_per_row": 32,
     "ksplit": 8,
+    "cluster": true,
     "default_tile": {
      "rows": 1,
      "unroll": 4,
@@ -120,7 +128,7 @@
     },
     "tiles": {
      "1": {
-      "rows": 2,
+      "rows": 1,
       "unroll": 2,
       "warps": 4
      },
@@ -131,7 +139,7 @@
      },
      "4": {
       "rows": 1,
-      "unroll": 2,
+      "unroll": 8,
       "warps": 4
      },
      "8": {
@@ -147,47 +155,52 @@
     }
    },
    "prefer_vendor": [
-    1,
     16
    ]
   },
   "bf16:2560x6144": {
-   "skinny_max_m": 4,
+   "skinny_max_m": 2,
    "tc": {
     "1": {
-     "cfg": 0,
-     "swap": true,
-     "stages": 4,
-     "ksplit": 8
-    },
-    "2": {
-     "cfg": 0,
+     "cfg": 9,
      "swap": true,
      "stages": 3,
-     "ksplit": 8
+     "ksplit": 8,
+     "cluster": false
+    },
+    "2": {
+     "cfg": 9,
+     "swap": true,
+     "stages": 3,
+     "ksplit": 8,
+     "cluster": false
     },
     "4": {
      "cfg": 0,
      "swap": true,
-     "stages": 8,
-     "ksplit": 4
+     "stages": 4,
+     "ksplit": 8,
+     "cluster": true
     },
     "8": {
      "cfg": 0,
      "swap": true,
-     "stages": 8,
-     "ksplit": 4
+     "stages": 4,
+     "ksplit": 8,
+     "cluster": true
     },
     "16": {
      "cfg": 0,
      "swap": true,
      "stages": 4,
-     "ksplit": 4
+     "ksplit": 4,
+     "cluster": true
     }
    },
    "skinny": {
     "lanes_per_row": 16,
     "ksplit": 4,
+    "cluster": false,
     "default_tile": {
      "rows": 1,
      "unroll": 4,
@@ -197,7 +210,7 @@
      "1": {
       "rows": 2,
       "unroll": 2,
-      "warps": 8
+      "warps": 2
      },
      "2": {
       "rows": 1,
@@ -220,11 +233,7 @@
       "warps": 4
      }
     }
-   },
-   "prefer_vendor": [
-    8,
-    16
-   ]
+   }
   },
   "bf16:13312x2560": {
    "skinny_max_m": 4,
@@ -232,37 +241,43 @@
     "1": {
      "cfg": 0,
      "swap": true,
-     "stages": 2,
-     "ksplit": 4
+     "stages": 3,
+     "ksplit": 2,
+     "cluster": false
     },
     "2": {
      "cfg": 0,
      "swap": true,
-     "stages": 2,
-     "ksplit": 4
+     "stages": 3,
+     "ksplit": 2,
+     "cluster": false
     },
     "4": {
      "cfg": 0,
      "swap": true,
-     "stages": 2,
-     "ksplit": 4
+     "stages": 3,
+     "ksplit": 2,
+     "cluster": false
     },
     "8": {
      "cfg": 0,
      "swap": true,
      "stages": 4,
-     "ksplit": 1
+     "ksplit": 1,
+     "cluster": false
     },
     "16": {
-     "cfg": 1,
+     "cfg": 0,
      "swap": true,
-     "stages": 5,
-     "ksplit": 1
+     "stages": 3,
+     "ksplit": 1,
+     "cluster": false
     }
    },
    "skinny": {
     "lanes_per_row": 16,
     "ksplit": 1,
+    "cluster": false,
     "default_tile": {
      "rows": 1,
      "unroll": 4,
@@ -270,24 +285,24 @@
     },
     "tiles": {
      "1": {
-      "rows": 2,
+      "rows": 1,
       "unroll": 2,
-      "warps": 8
+      "warps": 2
      },
      "2": {
-      "rows": 1,
+      "rows": 2,
       "unroll": 2,
       "warps": 2
      },
      "4": {
-      "rows": 1,
-      "unroll": 2,
-      "warps": 8
-     },
-     "8": {
       "rows": 2,
       "unroll": 2,
       "warps": 2
+     },
+     "8": {
+      "rows": 1,
+      "unroll": 2,
+      "warps": 8
      },
      "16": {
       "rows": 2,
@@ -298,42 +313,48 @@
    }
   },
   "bf16:640x2560": {
-   "skinny_max_m": 4,
+   "skinny_max_m": 2,
    "tc": {
     "1": {
-     "cfg": 0,
+     "cfg": 8,
      "swap": true,
      "stages": 4,
-     "ksplit": 8
+     "ksplit": 8,
+     "cluster": true
     },
     "2": {
-     "cfg": 0,
+     "cfg": 8,
      "swap": true,
      "stages": 4,
-     "ksplit": 8
+     "ksplit": 8,
+     "cluster": true
     },
     "4": {
-     "cfg": 0,
+     "cfg": 8,
      "swap": true,
-     "stages": 4,
-     "ksplit": 8
+     "stages": 3,
+     "ksplit": 8,
+     "cluster": true
     },
     "8": {
-     "cfg": 0,
-     "swap": false,
+     "cfg": 8,
+     "swap": true,
      "stages": 4,
-     "ksplit": 4
+     "ksplit": 8,
+     "cluster": true
     },
     "16": {
-     "cfg": 0,
-     "swap": false,
-     "stages": 2,
-     "ksplit": 8
+     "cfg": 9,
+     "swap": true,
+     "stages": 3,
+     "ksplit": 8,
+     "cluster": true
     }
    },
    "skinny": {
     "lanes_per_row": 32,
     "ksplit": 8,
+    "cluster": true,
     "default_tile": {
      "rows": 1,
      "unroll": 4,
@@ -343,74 +364,78 @@
      "1": {
       "rows": 2,
       "unroll": 2,
-      "warps": 4
+      "warps": 8
      },
      "2": {
-      "rows": 1,
+      "rows": 2,
       "unroll": 2,
       "warps": 8
      },
      "4": {
-      "rows": 1,
+      "rows": 2,
       "unroll": 2,
       "warps": 8
      },
      "8": {
       "rows": 2,
-      "unroll": 2,
-      "warps": 2
+      "unroll": 4,
+      "warps": 8
      },
      "16": {
       "rows": 2,
-      "unroll": 2,
-      "warps": 4
+      "unroll": 4,
+      "warps": 8
      }
     }
    },
    "prefer_vendor": [
-    1,
     4,
-    8,
-    16
+    8
    ]
   },
   "bf16:512x2560": {
-   "skinny_max_m": 4,
+   "skinny_max_m": 2,
    "tc": {
     "1": {
-     "cfg": 0,
+     "cfg": 8,
      "swap": true,
-     "stages": 8,
-     "ksplit": 8
+     "stages": 4,
+     "ksplit": 8,
+     "cluster": true
     },
     "2": {
-     "cfg": 0,
+     "cfg": 8,
      "swap": true,
-     "stages": 8,
-     "ksplit": 8
+     "stages": 4,
+     "ksplit": 8,
+     "cluster": true
     },
     "4": {
-     "cfg": 0,
-     "swap": false,
-     "stages": 3,
-     "ksplit": 8
+     "cfg": 8,
+     "swap": true,
+     "stages": 4,
+     "ksplit": 8,
+     "cluster": true
     },
     "8": {
-     "cfg": 0,
-     "swap": false,
-     "stages": 3,
-     "ksplit": 8
+     "cfg": 8,
+     "swap": true,
+     "stages": 4,
+     "ksplit": 8,
+     "cluster": true
     },
     "16": {
-     "cfg": 0,
-     "swap": false,
-     "stages": 3,
-     "ksplit": 8
+     "cfg": 9,
+     "swap": true,
+     "stages": 4,
+     "ksplit": 8,
+     "cluster": true
     }
    },
    "skinny": {
     "lanes_per_row": 32,
     "ksplit": 8,
+    "cluster": true,
     "default_tile": {
      "rows": 1,
      "unroll": 4,
@@ -420,74 +445,74 @@
      "1": {
       "rows": 2,
       "unroll": 2,
-      "warps": 4
+      "warps": 8
      },
      "2": {
-      "rows": 1,
+      "rows": 2,
       "unroll": 2,
       "warps": 8
      },
      "4": {
-      "rows": 1,
+      "rows": 2,
       "unroll": 2,
       "warps": 8
      },
      "8": {
-      "rows": 1,
+      "rows": 2,
       "unroll": 4,
-      "warps": 4
+      "warps": 8
      },
      "16": {
       "rows": 2,
-      "unroll": 2,
-      "warps": 4
+      "unroll": 4,
+      "warps": 8
      }
     }
-   },
-   "prefer_vendor": [
-    1,
-    4,
-    8,
-    16
-   ]
+   }
   },
   "bf16:1280x2560": {
-   "skinny_max_m": 1,
+   "skinny_max_m": 2,
    "tc": {
     "1": {
-     "cfg": 0,
+     "cfg": 8,
      "swap": true,
-     "stages": 8,
-     "ksplit": 4
+     "stages": 4,
+     "ksplit": 8,
+     "cluster": false
     },
     "2": {
-     "cfg": 0,
+     "cfg": 8,
      "swap": true,
-     "stages": 8,
-     "ksplit": 4
+     "stages": 4,
+     "ksplit": 8,
+     "cluster": false
     },
     "4": {
-     "cfg": 0,
+     "cfg": 9,
      "swap": true,
-     "stages": 8,
-     "ksplit": 4
+     "stages": 4,
+     "ksplit": 8,
+     "cluster": true
     },
     "8": {
-     "cfg": 0,
+     "cfg": 9,
      "swap": true,
-     "stages": 8,
-     "ksplit": 4
+     "stages": 4,
+     "ksplit": 8,
+     "cluster": true
     },
     "16": {
      "cfg": 0,
      "swap": true,
-     "stages": 8,
-     "ksplit": 4
+     "stages": 3,
+     "ksplit": 8,
+     "cluster": true
     }
    },
    "skinny": {
     "lanes_per_row": 32,
     "ksplit": 4,
+    "cluster": true,
     "default_tile": {
      "rows": 1,
      "unroll": 4,
@@ -500,70 +525,71 @@
       "warps": 8
      },
      "2": {
-      "rows": 1,
+      "rows": 2,
       "unroll": 2,
       "warps": 8
      },
      "4": {
-      "rows": 1,
+      "rows": 2,
       "unroll": 2,
-      "warps": 4
+      "warps": 8
      },
      "8": {
-      "rows": 1,
+      "rows": 2,
       "unroll": 2,
-      "warps": 4
+      "warps": 8
      },
      "16": {
       "rows": 2,
-      "unroll": 2,
-      "warps": 2
+      "unroll": 4,
+      "warps": 8
      }
     }
-   },
-   "prefer_vendor": [
-    4,
-    8,
-    16
-   ]
+   }
   },
   "bf16:2560x640": {
    "skinny_max_m": 4,
    "tc": {
     "1": {
-     "cfg": 0,
+     "cfg": 9,
      "swap": true,
-     "stages": 4,
-     "ksplit": 2
+     "stages": 3,
+     "ksplit": 4,
+     "cluster": true
     },
     "2": {
-     "cfg": 0,
+     "cfg": 9,
      "swap": true,
-     "stages": 4,
-     "ksplit": 2
+     "stages": 3,
+     "ksplit": 4,
+     "cluster": true
     },
     "4": {
-     "cfg": 0,
+     "cfg": 9,
      "swap": true,
-     "stages": 8,
-     "ksplit": 2
+     "stages": 3,
+     "ksplit": 4,
+     "cluster": true
     },
     "8": {
-     "cfg": 0,
+     "cfg": 9,
      "swap": true,
-     "stages": 4,
-     "ksplit": 2
+     "stages": 3,
+     "ksplit": 4,
+     "cluster": true
     },
     "16": {
      "cfg": 0,
      "swap": true,
-     "stages": 4,
-     "ksplit": 2
+     "stages": 3,
+     "ksplit": 4,
+     "cluster": true
     }
    },
    "skinny": {
     "lanes_per_row": 32,
     "ksplit": 1,
+    "cluster": false,
     "default_tile": {
      "rows": 1,
      "unroll": 4,
@@ -573,7 +599,7 @@
      "1": {
       "rows": 1,
       "unroll": 4,
-      "warps": 2
+      "warps": 8
      },
      "2": {
       "rows": 1,
@@ -587,205 +613,221 @@
      },
      "8": {
       "rows": 1,
-      "unroll": 2,
-      "warps": 2
-     },
-     "16": {
-      "rows": 1,
-      "unroll": 8,
-      "warps": 2
-     }
-    }
-   },
-   "prefer_vendor": [
-    8,
-    16
-   ]
-  },
-  "bf16:336x10240": {
-   "skinny_max_m": 4,
-   "tc": {
-    "1": {
-     "cfg": 0,
-     "swap": true,
-     "stages": 8,
-     "ksplit": 16
-    },
-    "2": {
-     "cfg": 0,
-     "swap": true,
-     "stages": 8,
-     "ksplit": 16
-    },
-    "4": {
-     "cfg": 0,
-     "swap": true,
-     "stages": 8,
-     "ksplit": 16
-    },
-    "8": {
-     "cfg": 0,
-     "swap": false,
-     "stages": 2,
-     "ksplit": 16
-    },
-    "16": {
-     "cfg": 0,
-     "swap": false,
-     "stages": 2,
-     "ksplit": 16
-    }
-   },
-   "skinny": {
-    "lanes_per_row": 32,
-    "ksplit": 16,
-    "default_tile": {
-     "rows": 1,
-     "unroll": 4,
-     "warps": 4
-    },
-    "tiles": {
-     "1": {
-      "rows": 4,
-      "unroll": 2,
-      "warps": 8
-     },
-     "2": {
-      "rows": 1,
-      "unroll": 2,
-      "warps": 8
-     },
-     "4": {
-      "rows": 2,
-      "unroll": 2,
-      "warps": 4
-     },
-     "8": {
-      "rows": 2,
-      "unroll": 2,
-      "warps": 4
-     },
-     "16": {
-      "rows": 2,
-      "unroll": 2,
-      "warps": 4
-     }
-    }
-   },
-   "prefer_vendor": [
-    4,
-    8,
-    16
-   ]
-  },
-  "bf16:10240x320": {
-   "skinny_max_m": 2,
-   "tc": {
-    "1": {
-     "cfg": 0,
-     "swap": true,
-     "stages": 3,
-     "ksplit": 1
-    },
-    "2": {
-     "cfg": 0,
-     "swap": true,
-     "stages": 3,
-     "ksplit": 1
-    },
-    "4": {
-     "cfg": 0,
-     "swap": true,
-     "stages": 3,
-     "ksplit": 1
-    },
-    "8": {
-     "cfg": 0,
-     "swap": true,
-     "stages": 3,
-     "ksplit": 1
-    },
-    "16": {
-     "cfg": 0,
-     "swap": true,
-     "stages": 4,
-     "ksplit": 1
-    }
-   },
-   "skinny": {
-    "lanes_per_row": 16,
-    "ksplit": 1,
-    "default_tile": {
-     "rows": 1,
-     "unroll": 4,
-     "warps": 4
-    },
-    "tiles": {
-     "1": {
-      "rows": 1,
-      "unroll": 2,
-      "warps": 4
-     },
-     "2": {
-      "rows": 2,
-      "unroll": 2,
-      "warps": 2
-     },
-     "4": {
-      "rows": 1,
-      "unroll": 2,
-      "warps": 4
-     },
-     "8": {
-      "rows": 1,
       "unroll": 8,
       "warps": 2
      },
      "16": {
       "rows": 1,
-      "unroll": 2,
+      "unroll": 8,
       "warps": 2
      }
     }
    }
   },
+  "bf16:336x10240": {
+   "skinny_max_m": 4,
+   "tc": {
+    "1": {
+     "cfg": 8,
+     "swap": false,
+     "stages": 4,
+     "ksplit": 16,
+     "cluster": false
+    },
+    "2": {
+     "cfg": 8,
+     "swap": false,
+     "stages": 4,
+     "ksplit": 16,
+     "cluster": false
+    },
+    "4": {
+     "cfg": 8,
+     "swap": false,
+     "stages": 4,
+     "ksplit": 16,
+     "cluster": false
+    },
+    "8": {
+     "cfg": 9,
+     "swap": false,
+     "stages": 3,
+     "ksplit": 16,
+     "cluster": false
+    },
+    "16": {
+     "cfg": 9,
+     "swap": false,
+     "stages": 3,
+     "ksplit": 16,
+     "cluster": false
+    }
+   },
+   "skinny": {
+    "lanes_per_row": 32,
+    "ksplit": 8,
+    "cluster": true,
+    "default_tile": {
+     "rows": 1,
+     "unroll": 4,
+     "warps": 4
+    },
+    "tiles": {
+     "1": {
+      "rows": 2,
+      "unroll": 4,
+      "warps": 8
+     },
+     "2": {
+      "rows": 1,
+      "unroll": 2,
+      "warps": 8
+     },
+     "4": {
+      "rows": 1,
+      "unroll": 2,
+      "warps": 8
+     },
+     "8": {
+      "rows": 1,
+      "unroll": 2,
+      "warps": 8
+     },
+     "16": {
+      "rows": 1,
+      "unroll": 2,
+      "warps": 8
+     }
+    }
+   },
+   "prefer_vendor": [
+    8,
+    16
+   ]
+  },
+  "bf16:10240x320": {
+   "skinny_max_m": 4,
+   "tc": {
+    "1": {
+     "cfg": 8,
+     "swap": true,
+     "stages": 4,
+     "ksplit": 1,
+     "cluster": false
+    },
+    "2": {
+     "cfg": 8,
+     "swap": true,
+     "stages": 3,
+     "ksplit": 1,
+     "cluster": false
+    },
+    "4": {
+     "cfg": 9,
+     "swap": true,
+     "stages": 4,
+     "ksplit": 1,
+     "cluster": false
+    },
+    "8": {
+     "cfg": 9,
+     "swap": true,
+     "stages": 3,
+     "ksplit": 1,
+     "cluster": false
+    },
+    "16": {
+     "cfg": 9,
+     "swap": true,
+     "stages": 3,
+     "ksplit": 1,
+     "cluster": false
+    }
+   },
+   "skinny": {
+    "lanes_per_row": 16,
+    "ksplit": 1,
+    "cluster": false,
+    "default_tile": {
+     "rows": 1,
+     "unroll": 4,
+     "warps": 4
+    },
+    "tiles": {
+     "1": {
+      "rows": 4,
+      "unroll": 2,
+      "warps": 8
+     },
+     "2": {
+      "rows": 1,
+      "unroll": 4,
+      "warps": 4
+     },
+     "4": {
+      "rows": 1,
+      "unroll": 2,
+      "warps": 4
+     },
+     "8": {
+      "rows": 1,
+      "unroll": 2,
+      "warps": 4
+     },
+     "16": {
+      "rows": 1,
+      "unroll": 2,
+      "warps": 4
+     }
+    }
+   },
+   "prefer_vendor": [
+    16
+   ]
+  },
   "bf16:320x10240": {
    "skinny_max_m": 4,
    "tc": {
     "1": {
-     "cfg": 0,
-     "swap": true,
-     "stages": 8,
-     "ksplit": 16
+     "cfg": 8,
+     "swap": false,
+     "stages": 4,
+     "ksplit": 16,
+     "cluster": false
     },
     "2": {
-     "cfg": 0,
-     "swap": true,
-     "stages": 8,
-     "ksplit": 16
+     "cfg": 8,
+     "swap": false,
+     "stages": 4,
+     "ksplit": 16,
+     "cluster": false
     },
     "4": {
-     "cfg": 0,
-     "swap": true,
-     "stages": 8,
-     "ksplit": 16
+     "cfg": 8,
+     "swap": false,
+     "stages": 4,
+     "ksplit": 16,
+     "cluster": false
     },
     "8": {
-     "cfg": 0,
+     "cfg": 9,
      "swap": false,
-     "stages": 2,
-     "ksplit": 16
+     "stages": 3,
+     "ksplit": 16,
+     "cluster": false
     },
     "16": {
-     "cfg": 0,
+     "cfg": 9,
      "swap": false,
-     "stages": 2,
-     "ksplit": 16
+     "stages": 3,
+     "ksplit": 16,
+     "cluster": false
     }
    },
    "skinny": {
     "lanes_per_row": 32,
     "ksplit": 16,
+    "cluster": false,
     "default_tile": {
      "rows": 1,
      "unroll": 4,
@@ -800,27 +842,26 @@
      "2": {
       "rows": 1,
       "unroll": 2,
-      "warps": 4
+      "warps": 8
      },
      "4": {
       "rows": 1,
-      "unroll": 8,
+      "unroll": 2,
       "warps": 4
      },
      "8": {
-      "rows": 2,
+      "rows": 1,
       "unroll": 2,
-      "warps": 2
+      "warps": 4
      },
      "16": {
-      "rows": 2,
+      "rows": 1,
       "unroll": 2,
       "warps": 4
      }
     }
    },
    "prefer_vendor": [
-    4,
     8,
     16
    ]
@@ -894,45 +935,54 @@
       "warps": 8
      }
     }
-   }
+   },
+   "prefer_vendor": [
+    16
+   ]
   },
   "bf16:2560x2560": {
-   "skinny_max_m": 4,
+   "skinny_max_m": 2,
    "tc": {
     "1": {
-     "cfg": 0,
+     "cfg": 9,
      "swap": true,
      "stages": 3,
-     "ksplit": 4
+     "ksplit": 4,
+     "cluster": true
     },
     "2": {
-     "cfg": 0,
+     "cfg": 8,
      "swap": true,
-     "stages": 4,
-     "ksplit": 4
+     "stages": 3,
+     "ksplit": 4,
+     "cluster": false
     },
     "4": {
-     "cfg": 0,
+     "cfg": 9,
      "swap": true,
-     "stages": 4,
-     "ksplit": 4
+     "stages": 3,
+     "ksplit": 4,
+     "cluster": true
     },
     "8": {
-     "cfg": 0,
+     "cfg": 9,
      "swap": true,
-     "stages": 8,
-     "ksplit": 2
+     "stages": 4,
+     "ksplit": 4,
+     "cluster": true
     },
     "16": {
      "cfg": 0,
      "swap": true,
-     "stages": 8,
-     "ksplit": 2
+     "stages": 4,
+     "ksplit": 4,
+     "cluster": true
     }
    },
    "skinny": {
     "lanes_per_row": 16,
     "ksplit": 4,
+    "cluster": false,
     "default_tile": {
      "rows": 1,
      "unroll": 4,
@@ -942,7 +992,7 @@
      "1": {
       "rows": 2,
       "unroll": 2,
-      "warps": 8
+      "warps": 4
      },
      "2": {
       "rows": 1,

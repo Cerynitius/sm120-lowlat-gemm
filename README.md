@@ -82,6 +82,17 @@ y = L.gemm(xq, w_fp4, x_block_scale=x_sf, w_block_scale=w_sf,
 | `bias` | `[N]` bf16 / f16 / f32 |
 | `out_dtype` | bf16 (default for quantized inputs), f16, f32 |
 | `out` | preallocated `[M, N]` output |
+| `prefetch`, `prefetch_bytes` | a contiguous tensor (e.g. the next GEMM's weight) to pull into L2 once this GEMM's weight is streaming; first `prefetch_bytes` (0 = all) |
+
+### Launch options
+
+```python
+L.set_pdl(True)   # programmatic dependent launch for later calls (process-wide)
+```
+
+With PDL a GEMM may start while the previous kernel is still running and stream its weight early. Enable it only
+when no kernel still in flight writes the weights (inference with fixed weights). CUDA graphs keep the setting
+they were captured with.
 
 FP4 tensors are `torch.float4_e2m1fn_x2` (or `uint8` together with a block scale), two values per byte, low
 nibble first, shape `[rows, K/2]`. K must be a multiple of 8 (16-bit), 16 (8-bit) or 64 (FP4); rows must be
@@ -92,8 +103,11 @@ nibble first, shape `[rows, K/2]`. K must be a multiple of 8 (16-bit), 16 (8-bit
 ```python
 from lowlat_gemm import Plan, TcChoice
 L.set_plan("bf16", 11008, 4096, Plan(tc={1: TcChoice(cfg=0, swap=True, stages=6, ksplit=4)}))
-L.load_plans("plans.json")
+L.load_plans("plans.json")   # takes precedence over the packaged plans
 ```
+
+`TcChoice(..., cluster=True)` and `SkinnyOrder(..., cluster=True)` reduce split-K partials inside a thread block
+cluster (`ksplit <= 8`, no workspace); results are identical to the workspace path.
 
 Lookup order: `set_plan()`, the file in `LLG_PLAN_FILE`, a packaged plan for the device, built-in heuristics.
 A tuned entry serves token counts from its M up to the next tuned M; above twice the largest tuned M the heuristics
@@ -112,11 +126,23 @@ python tools/tune.py  --shapes shapes/qwen3.8-flash-next-tp1.json --kinds bf16,f
 python tools/bench.py --shapes shapes/qwen3.8-flash-next-tp1.json --kinds bf16,fp8,nvfp4 --plans plans.json \
     --json bench.json
 python tools/prefer_vendor.py --plans plans.json --bench bench.json   # record where the vendor library wins
+python tools/decode_step.py --step shapes/qwen3.8-flash-next-tp1-step.json --tokens 1,2,4,8
 pytest tests
 python tests/emulate_tc.py        # CPU thread-level emulation of the tensor-core kernel's indexing
 ```
 
 A shape file lists `{"name", "n", "k"}` entries.
+
+| bench.py / tune.py option | Meaning |
+|---|---|
+| `--pdl` | programmatic dependent launch |
+| `--between write` | a small kernel rewrites x before every GEMM; its own time is subtracted |
+| `--prefetch-next` (bench) | every call prefetches the next call's weight (`--prefetch-max-mb`) |
+| `--max-calls N` (tune) | cap the calls per timed graph |
+
+`decode_step.py` replays the projections of one decode step in execution order (per-layer weights, producer
+kernels and a routed-expert stand-in between them) for the vendor GEMM and lowlat_gemm with and without PDL and
+next-weight prefetch.
 
 ## vLLM
 
@@ -136,6 +162,9 @@ vendor library.
 | `LLG_VLLM_MODELS` | hook targets, `,`-separated (default `qwen4_exp`) |
 | `LLG_VLLM_MAX_TOKENS` | largest batch routed to lowlat_gemm (default 16) |
 | `LLG_PLAN_FILE` | plan file from `tools/tune.py` |
+| `LLG_PDL` | programmatic dependent launch (default 1) |
+| `LLG_PREFETCH` | each routed GEMM prefetches the next projection's weight into L2; order recorded from eager forwards (default 1) |
+| `LLG_PREFETCH_MAX_MB` | cap per prefetch (default 16) |
 
 ## License
 

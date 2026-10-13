@@ -178,8 +178,14 @@ __global__ void __launch_bounds__(256) gemv_kernel(const Params p) {
     const uint32_t base = smem_addr(red);
     for (int i = e0 + threadIdx.x; i < e1; i += blockDim.x) {
       const uint32_t addr = base + (uint32_t)i * 4u;
-      float s = __uint_as_float(ld_cluster_u32(cluster_map(addr, 0)));
-      for (int k = 1; k < p.ksplit; ++k) s += __uint_as_float(ld_cluster_u32(cluster_map(addr, (uint32_t)k)));
+      uint32_t v[8];  // ksplit <= 8: issue every remote load, then add in split order
+#pragma unroll
+      for (int k = 0; k < 8; ++k)
+        if (k < p.ksplit) v[k] = ld_cluster_u32(cluster_map(addr, (uint32_t)k));
+      float s = __uint_as_float(v[0]);
+#pragma unroll
+      for (int k = 1; k < 8; ++k)
+        if (k < p.ksplit) s += __uint_as_float(v[k]);
       store_out<F16>(p, i % p.M, block_row0 + i / p.M, s);
     }
     cluster_sync();  // keep this block's partials alive until every block has read them
@@ -209,8 +215,19 @@ __global__ void __launch_bounds__(256) gemv_kernel(const Params p) {
   for (int i = threadIdx.x; i < nrows * p.M; i += blockDim.x) {
     const int m = i / nrows;
     const int n = block_row0 + i % nrows;
-    float s = __ldcg(&p.ws[(int64_t)m * p.N + n]);
-    for (int k = 1; k < p.ksplit; ++k) s += __ldcg(&p.ws[((int64_t)k * p.M + m) * p.N + n]);
+    const float* src = p.ws + (int64_t)m * p.N + n;
+    const int64_t plane = (int64_t)p.M * p.N;
+    float s = 0.f;
+    // 8 partials in flight at a time, added in split order
+    for (int k0 = 0; k0 < p.ksplit; k0 += 8) {
+      float v[8];
+#pragma unroll
+      for (int j = 0; j < 8; ++j)
+        if (k0 + j < p.ksplit) v[j] = __ldcg(src + (k0 + j) * plane);
+#pragma unroll
+      for (int j = 0; j < 8; ++j)
+        if (k0 + j < p.ksplit) s = (k0 + j == 0) ? v[j] : s + v[j];
+    }
     store_out<F16>(p, m, n, s);
   }
   if (threadIdx.x == 0) p.counters[blockIdx.x] = 0u;
